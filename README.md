@@ -37,13 +37,13 @@ PINNs/
 |----------|--------|-------|
 | $x^*$ | $x / L_x$ | $L_x = 1\,\mathrm{m}$ |
 | $y^*$ | $y / L_y$ | $L_y = 1\,\mathrm{m}$ |
-| $t^*$ | $t / t_{\max}$ | normalisé sur $[0,1]$ pour le réseau |
+| $t^*$ | $\alpha t / L_{\mathrm{ref}}^2$ | $t^* \in [0,\ t^*_{\max}]$, $t^*_{\max} \approx 0.1$ |
 | $T^*$ | $(T - T_{\mathrm{amb}}) / (T_{\mathrm{obj}} - T_{\mathrm{amb}})$ | $T_{\mathrm{amb}}=20^\circ\mathrm{C}$, $T_{\mathrm{obj}}=80^\circ\mathrm{C}$ |
 
-La diffusivité $\alpha = 2\times 10^{-5}\,\mathrm{m}^2/\mathrm{s}$ (ordre de grandeur de l'air) définit le temps de référence $t_{\mathrm{ref}} = L^2/\alpha$ et le nombre de Fourier $Fo = \alpha t / L^2$.
+La diffusivité $\alpha = 2\times 10^{-5}\,\mathrm{m}^2/\mathrm{s}$ (ordre de grandeur de l'air) définit le temps de référence $t_{\mathrm{ref}} = L^2/\alpha$ et le nombre de Fourier $Fo = t^* = \alpha t / L^2$. Avec $t_{\max}=5000\,\mathrm{s}$ : **$t^*_{\max} = 0.1$** (pas $1.0$).
 
-Conditions aux limites Dirichlet adimensionnées : **$T^* = 0$** sur les 4 parois (température ambiante).  
-Condition initiale : **$t^* = 0$**, $T^* = 0$ (pièce initialement à $T_{\mathrm{amb}}$).
+Conditions aux limites Dirichlet adimensionnées : **$T^* = 0$** sur les 4 parois (température ambiante), $t^* \in [0,\ t^*_{\max}]$.  
+Condition initiale : **$t^* = 0$**, **$T^* = 1$** dans l'objet chaud (disque centré, $r^*=0.15$), **$T^* = 0$** à l'extérieur.
 
 ---
 
@@ -86,9 +86,9 @@ python main_step1.py --out collocation_points.png
 
 | Ensemble | Symbole | N | Contrainte |
 |----------|---------|---|------------|
-| Condition initiale | `N_ic` | 2 000 | $t^* = 0$ |
-| Conditions aux limites | `N_bc` | 2 000 | $T^* = 0$, 4 parois |
-| Résidu PDE | `N_res` | 20 000 | intérieur $(0,1)^3$ |
+| Condition initiale | `N_ic` | 2 000 | $t^* = 0$, $T^*\in\{0,1\}$ (objet chaud) |
+| Conditions aux limites | `N_bc` | 2 000 | $T^* = 0$, 4 parois, $t^*\in[0,t^*_{\max}]$ |
+| Résidu PDE | `N_res` | 20 000 | $(x^*,y^*)\in(0,1)^2$, $t^*\in(0,t^*_{\max})$ |
 
 Les coordonnées $(x^*, y^*, t^*)$ sont des tenseurs PyTorch avec `requires_grad=True` pour l'autograd des dérivées PDE.
 

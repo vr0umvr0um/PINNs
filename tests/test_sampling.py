@@ -4,9 +4,11 @@ Tests unitaires — Étape 1 : adimensionnement & échantillonnage.
 Vérifie :
     - dimensions (shapes) des tenseurs IC / BC / résidu
     - t* = 0 pour la condition initiale
+    - T* ∈ {0, 1} pour l'IC (objet chaud → 1, extérieur → 0)
     - T* = 0 pour les conditions aux limites Dirichlet
+    - t* ∈ [0, t*_max] pour BC et résidu (t*_max ≈ 0.1, PAS [0, 1])
     - requires_grad=True sur les coordonnées (x*, y*, t*)
-    - appartenance au domaine [0, 1]
+    - appartenance au domaine spatial [0, 1]
     - répartition équilibrée des points BC sur les 4 parois
     - helpers d'adimensionnement de DataConfig
 """
@@ -22,6 +24,7 @@ from src.sampling import sample_bc, sample_ic, sample_residual, sample_all
 from src.utils import (
     latin_hypercube,
     mask_boundary,
+    mask_hot_object,
     mask_interior,
     sobol_sample,
 )
@@ -84,7 +87,28 @@ class TestDataConfig:
     def test_t_ref_and_fourier(self):
         c = DataConfig(Lx=1.0, Ly=1.0, alpha=2e-5, t_max=5000.0)
         assert c.t_ref == pytest.approx(1.0 / 2e-5)
+        assert c.t_star_max == pytest.approx(0.1)
         assert c.t_star_max == pytest.approx(5000.0 * 2e-5 / 1.0)
+
+    def test_t_star_range_is_fourier(self):
+        """t* doit vivre dans [0, t*_max≈0.1], pas [0, 1]."""
+        c = DataConfig()
+        assert c.t_star_range == (0.0, c.t_star_max)
+        assert c.t_star_range[1] == pytest.approx(0.1)
+        assert c.t_star_range[1] < 1.0
+
+    def test_to_t_star_fourier(self):
+        c = DataConfig()
+        assert c.to_t_star(0.0) == pytest.approx(0.0)
+        assert c.to_t_star(c.t_max) == pytest.approx(c.t_star_max)
+        assert c.from_t_star(c.t_star_max) == pytest.approx(c.t_max)
+
+    def test_point_in_object_disk(self):
+        c = DataConfig(obj_shape="disk", obj_cx=0.5, obj_cy=0.5, obj_radius=0.15)
+        assert c.point_in_object(0.5, 0.5) is True
+        assert c.point_in_object(0.5 + 0.14, 0.5) is True  # strictly inside
+        assert c.point_in_object(0.5 + 0.16, 0.5) is False  # strictly outside
+        assert c.point_in_object(0.9, 0.9) is False
 
     def test_summary_str(self):
         text = DataConfig().summary()
@@ -123,6 +147,18 @@ class TestUtils:
         assert interior.tolist() == [False, False, False, True, True]
         assert boundary.tolist() == [True, True, True, False, False]
 
+    def test_mask_hot_object_disk(self):
+        x = np.array([0.5, 0.5, 0.9, 0.5 + 0.1])
+        y = np.array([0.5, 0.9, 0.9, 0.5])
+        m = mask_hot_object(x, y, cx=0.5, cy=0.5, radius=0.15, shape="disk")
+        assert m.tolist() == [True, False, False, True]
+
+    def test_mask_hot_object_square(self):
+        x = np.array([0.5, 0.5 + 0.1, 0.5 + 0.2])
+        y = np.array([0.5, 0.5 + 0.1, 0.5])
+        m = mask_hot_object(x, y, cx=0.5, cy=0.5, radius=0.15, shape="square")
+        assert m.tolist() == [True, True, False]
+
 
 # ---------------------------------------------------------------------------
 # sample_ic
@@ -142,11 +178,35 @@ class TestSampleIC:
         ic = sample_ic(cfg)
         assert torch.allclose(ic["t_star"], torch.zeros_like(ic["t_star"]))
 
-    def test_T_star_default_zero(self, cfg: DataConfig):
+    def test_T_star_has_hot_and_cold(self, cfg: DataConfig):
+        """
+        BUG FIX : l'IC doit contenir T*=1 dans l'objet chaud et T*=0 dehors.
+        → T* ∈ [0.00, 1.00]
+        """
         ic = sample_ic(cfg)
-        assert torch.allclose(ic["T_star"], torch.zeros_like(ic["T_star"]))
+        T = ic["T_star"].detach()
+        assert float(T.min()) == pytest.approx(0.0)
+        assert float(T.max()) == pytest.approx(1.0)
+        # Uniquement les deux valeurs {0, 1}
+        unique = torch.unique(T)
+        assert set(unique.tolist()) <= {0.0, 1.0}
+        assert (T == 1.0).any() and (T == 0.0).any()
 
-    def test_T_star_custom(self, cfg: DataConfig):
+    def test_T_star_matches_object_mask(self, cfg: DataConfig):
+        ic = sample_ic(cfg)
+        x = ic["x_star"].detach().cpu().numpy().ravel()
+        y = ic["y_star"].detach().cpu().numpy().ravel()
+        T = ic["T_star"].detach().cpu().numpy().ravel()
+        inside = mask_hot_object(
+            x, y,
+            cx=cfg.obj_cx, cy=cfg.obj_cy,
+            radius=cfg.obj_radius, shape=cfg.obj_shape,
+        )
+        assert np.allclose(T[inside], 1.0)
+        assert np.allclose(T[~inside], 0.0)
+
+    def test_T_star_uniform_override(self, cfg: DataConfig):
+        """Override optionnel pour tests : IC uniforme."""
         ic = sample_ic(cfg, T_star_init=0.5)
         assert torch.allclose(ic["T_star"], torch.full_like(ic["T_star"], 0.5))
 
@@ -164,16 +224,26 @@ class TestSampleIC:
         assert torch.all(x >= 0) and torch.all(x <= 1)
         assert torch.all(y >= 0) and torch.all(y <= 1)
 
-    def test_full_budget_shapes(self, cfg_full: DataConfig):
+    def test_full_budget_shapes_and_T_range(self, cfg_full: DataConfig):
         ic = sample_ic(cfg_full)
         assert ic["x_star"].shape == (2000, 1)
         assert ic["t_star"].shape == (2000, 1)
+        T = ic["T_star"].detach()
+        assert float(T.min()) == pytest.approx(0.0)
+        assert float(T.max()) == pytest.approx(1.0)
 
     @pytest.mark.parametrize("method", ["sobol", "lhs", "uniform"])
     def test_methods(self, cfg: DataConfig, method: str):
         ic = sample_ic(cfg, method=method)  # type: ignore[arg-type]
         assert ic["x_star"].shape[0] == cfg.N_ic
         assert torch.allclose(ic["t_star"], torch.zeros_like(ic["t_star"]))
+        assert float(ic["T_star"].max()) == pytest.approx(1.0)
+
+    def test_square_object(self, cfg: DataConfig):
+        cfg.obj_shape = "square"
+        ic = sample_ic(cfg)
+        assert float(ic["T_star"].max()) == pytest.approx(1.0)
+        assert float(ic["T_star"].min()) == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -222,15 +292,27 @@ class TestSampleBC:
         assert sum(counts) == cfg.N_bc
         assert max(counts) - min(counts) <= 1
 
-    def test_time_in_unit_interval(self, cfg: DataConfig):
+    def test_time_in_fourier_interval(self, cfg: DataConfig):
+        """
+        BUG FIX : t* ∈ [0, t*_max] avec t*_max ≈ 0.1, PAS [0, 1].
+        """
         bc = sample_bc(cfg)
         t = bc["t_star"].detach()
-        assert torch.all(t >= 0) and torch.all(t <= 1)
+        t_max_star = cfg.t_star_max
+        assert t_max_star == pytest.approx(0.1)
+        assert torch.all(t >= 0)
+        assert torch.all(t <= t_max_star + 1e-9)
+        # Doit effectivement explorer le haut de l'intervalle (pas collé à 0)
+        assert float(t.max()) > 0.5 * t_max_star
+        # Ne doit PAS atteindre 1.0
+        assert float(t.max()) < 0.5  # largement sous 1.0
 
     def test_full_budget_shapes(self, cfg_full: DataConfig):
         bc = sample_bc(cfg_full)
         assert bc["T_star"].shape == (2000, 1)
         assert torch.allclose(bc["T_star"], torch.zeros(2000, 1))
+        t = bc["t_star"].detach()
+        assert float(t.max()) <= cfg_full.t_star_max + 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -252,15 +334,31 @@ class TestSampleResidual:
         assert res["y_star"].requires_grad is True
         assert res["t_star"].requires_grad is True
 
-    def test_strictly_interior(self, cfg: DataConfig):
+    def test_spatial_strictly_interior(self, cfg: DataConfig):
         res = sample_residual(cfg)
-        for key in ("x_star", "y_star", "t_star"):
+        for key in ("x_star", "y_star"):
             v = res[key].detach()
             assert torch.all(v > 0.0) and torch.all(v < 1.0)
+
+    def test_time_in_fourier_interval(self, cfg: DataConfig):
+        """
+        BUG FIX : t* ∈ (0, t*_max) avec t*_max ≈ 0.1, PAS (0, 1).
+        """
+        res = sample_residual(cfg)
+        t = res["t_star"].detach()
+        t_max_star = cfg.t_star_max
+        assert t_max_star == pytest.approx(0.1)
+        assert torch.all(t > 0.0)
+        assert torch.all(t < t_max_star)
+        assert float(t.max()) > 0.5 * t_max_star
+        assert float(t.max()) < 0.5  # largement sous 1.0
 
     def test_full_budget_shapes(self, cfg_full: DataConfig):
         res = sample_residual(cfg_full)
         assert res["x_star"].shape == (20000, 1)
+        t = res["t_star"].detach()
+        assert float(t.max()) < cfg_full.t_star_max
+        assert float(t.min()) > 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -284,15 +382,32 @@ class TestSampleAll:
 # ---------------------------------------------------------------------------
 
 class TestSpecInvariants:
-    """Reprise explicite des contraintes du brief Étape 1."""
+    """Reprise explicite des contraintes du brief Étape 1 (+ bugfixes)."""
 
     def test_ic_t_star_zero_full(self, cfg_full: DataConfig):
         ic = sample_ic(cfg_full)
         assert torch.all(ic["t_star"] == 0)
 
+    def test_ic_T_star_range_full(self, cfg_full: DataConfig):
+        ic = sample_ic(cfg_full)
+        T = ic["T_star"].detach()
+        assert float(T.min()) == pytest.approx(0.0)
+        assert float(T.max()) == pytest.approx(1.0)
+
     def test_bc_T_star_zero_full(self, cfg_full: DataConfig):
         bc = sample_bc(cfg_full)
         assert torch.all(bc["T_star"] == 0)
+
+    def test_time_domain_is_fourier_not_unit(self, cfg_full: DataConfig):
+        bc = sample_bc(cfg_full)
+        res = sample_residual(cfg_full)
+        t_max = cfg_full.t_star_max
+        assert t_max == pytest.approx(0.1)
+        assert float(bc["t_star"].detach().max()) <= t_max + 1e-9
+        assert float(res["t_star"].detach().max()) < t_max
+        # Explicit rejection of the old [0, 1] bug
+        assert float(bc["t_star"].detach().max()) < 0.5
+        assert float(res["t_star"].detach().max()) < 0.5
 
     def test_nominal_shapes(self, cfg_full: DataConfig):
         ic = sample_ic(cfg_full)
