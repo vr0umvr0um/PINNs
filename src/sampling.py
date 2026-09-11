@@ -1,134 +1,390 @@
 """
-Échantillonnage des points de collocation pour le PINN thermique 2D.
+==============================================================================
+src/sampling.py — Génération des points de collocation du PINN
+==============================================================================
 
-Trois familles de points (domaine adimensionné) :
+POURQUOI TROIS FAMILLES DE POINTS ?
+-----------------------------------
+Un PINN minimise une loss totale :
 
-1. Condition initiale  (sample_ic)
-       t* = 0, (x*, y*) ∈ [0, 1]²
-       T* = 1 à l'intérieur de l'objet chaud, T* = 0 à l'extérieur
+    L = λ_ic · L_ic  +  λ_bc · L_bc  +  λ_res · L_res
 
-2. Conditions aux limites (sample_bc)
-       4 parois, T* = 0 (Dirichlet ambiante)
-       t* ∈ [0, t*_max]   (t*_max = α t_max / L_ref² ≈ 0.1)
+chacune évaluée sur SA propre famille de points :
 
-3. Résidu PDE (sample_residual)
-       (x*, y*) ∈ ]0, 1[²,  t* ∈ ]0, t*_max[
+1. sample_ic        → condition initiale
+       t* = 0
+       (x*, y*) ∈ [0, 1]²
+       T* = 1 dans l'objet chaud, 0 ailleurs
+       Loss typique : MSE( T_pred(x*,y*,0), T*_cible )
 
-Chaque fonction retourne un dictionnaire de tenseurs PyTorch. Les
-coordonnées spatiales / temporelles sont créées avec requires_grad=True
-afin de permettre le calcul automatique des dérivées (autograd) lors
-de l'évaluation du résidu.
+2. sample_bc        → conditions aux limites Dirichlet
+       4 parois du carré
+       T* = 0  (parois maintenues à T_amb)
+       t* ∈ [0, t*_max]
+       Loss typique : MSE( T_pred(paroi, t*), 0 )
+
+3. sample_residual  → résidu de l'équation aux dérivées partielles
+       (x*, y*) ∈ (0, 1)²   (strictement intérieur)
+       t*      ∈ (0, t*_max)
+       Loss typique : MSE( ∂T*/∂t* − Δ*T* ,  0 )
+       Les dérivées sont obtenues par AUTOGRAD PyTorch
+       (d'où requires_grad=True sur x*, y*, t*).
+
+Convention de sortie
+--------------------
+Chaque fonction renvoie un dict[str, torch.Tensor] :
+
+    {
+      "x_star": Tensor de shape (N, 1), requires_grad=True,
+      "y_star": Tensor de shape (N, 1), requires_grad=True,
+      "t_star": Tensor de shape (N, 1), requires_grad=True,
+      "T_star": Tensor de shape (N, 1), requires_grad=False,  # si cible
+      ...
+    }
+
+La shape (N, 1) = (batch_size, n_features=1) est le format attendu
+par un MLP qui prend une coordonnée scalaire à la fois, ou qui les
+concatène en (N, 3) juste avant l'avant.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 import numpy as np
 import torch
 
 from config import DEFAULT_CONFIG, DataConfig
-from src.utils import latin_hypercube, mask_hot_object, set_seed, sobol_sample, to_tensor
+from src.utils import (
+    latin_hypercube,
+    mask_hot_object,
+    set_seed,
+    sobol_sample,
+    to_tensor,
+)
 
+# Méthodes d'échantillonnage supportées.
+# "sobol"    : faible discrépance (recommandé par défaut)
+# "lhs"      : Latin Hypercube
+# "uniform"  : i.i.d. uniforme (baseline, moins bon en couverture)
 SamplingMethod = Literal["sobol", "lhs", "uniform"]
 
+# Type de retour standardisé pour IC / BC / résidu
+CollocationBatch = Dict[str, torch.Tensor]
 
-def _sample_unit(
-    n: int,
-    dim: int,
+
+# ==========================================================================
+# Helpers privés (préfix _  →  non exportés)
+# ==========================================================================
+
+def _sample_in_unit_hypercube(
+    n_points: int,
+    n_dimensions: int,
     method: SamplingMethod,
     seed: int,
 ) -> np.ndarray:
-    """Tire n points dans [0, 1]^dim selon la méthode choisie."""
+    """
+    Tire n_points dans le hypercube unité [0, 1]^{n_dimensions}.
+
+    POURQUOI factoriser cette fonction ?
+        IC, BC et résidu ont tous besoin d'un tirage "brut" dans [0, 1]^d
+        qu'ils scalent ensuite vers leur domaine physique propre
+        (objet, paroi, [0, t*_max]…). Centraliser évite de dupliquer
+        le switch sobol/lhs/uniform et garantit le même comportement.
+
+    Parameters
+    ----------
+    n_points : int
+        Nombre de points à tirer.
+    n_dimensions : int
+        Dimension de l'espace de tirage.
+        Exemples :
+            2 → (x*, y*) pour l'IC
+            2 → (coordonnée_libre, t*_unitaire) pour une paroi BC
+            3 → (x*, y*, t*_unitaire) pour le résidu
+    method : SamplingMethod
+        "sobol" | "lhs" | "uniform".
+    seed : int
+        Graine de reproductibilité.
+
+    Returns
+    -------
+    samples : np.ndarray of shape (n_points, n_dimensions)
+        Valeurs dans [0, 1].
+    """
     if method == "sobol":
-        return sobol_sample(n, dim, seed=seed)
+        return sobol_sample(n_points, n_dimensions, seed=seed)
+
     if method == "lhs":
-        return latin_hypercube(n, dim, seed=seed)
+        return latin_hypercube(n_points, n_dimensions, seed=seed)
+
     if method == "uniform":
         rng = np.random.default_rng(seed)
-        return rng.random((n, dim), dtype=np.float64)
-    raise ValueError(f"Unknown sampling method: {method!r}")
+        return rng.random((n_points, n_dimensions), dtype=np.float64)
+
+    raise ValueError(
+        f"Méthode d'échantillonnage inconnue : {method!r}. "
+        "Choisir 'sobol', 'lhs' ou 'uniform'."
+    )
 
 
-def _scale_time(u: np.ndarray, t_max_star: float) -> np.ndarray:
-    """Affine u ∈ [0, 1] → t* ∈ [0, t*_max]."""
-    return u * t_max_star
+def _scale_unit_time_to_fourier(
+    unit_time: np.ndarray,
+    t_star_max: float,
+) -> np.ndarray:
+    """
+    Affine le temps unitaire u ∈ [0, 1] vers le temps de Fourier t*.
+
+        t* = u · t*_max
+
+    POURQUOI cette étape est CRITIQUE (bug fréquent) :
+        Si on oublie ce scaling, t* vit dans [0, 1] au lieu de
+        [0, t*_max ≈ 0.1]. Le PINN croit alors résoudre l'EDP sur
+        un horizon 10× trop long (Fo=1 au lieu de Fo=0.1).
+
+    Parameters
+    ----------
+    unit_time : np.ndarray
+        Tirage dans [0, 1], shape quelconque.
+    t_star_max : float
+        Borne haute de Fourier (= α t_max / L_ref²).
+
+    Returns
+    -------
+    t_star : np.ndarray
+        Même shape que unit_time, valeurs dans [0, t_star_max].
+    """
+    return unit_time * t_star_max
 
 
-def _ic_temperature(
-    x: np.ndarray,
-    y: np.ndarray,
+def _initial_temperature_field(
+    x_star: np.ndarray,
+    y_star: np.ndarray,
     cfg: DataConfig,
 ) -> np.ndarray:
     """
-    Champ T* de condition initiale.
+    Construit le champ de température adimensionné à t* = 0.
 
-    T* = 1.0 à l'intérieur de l'objet chaud, 0.0 à l'extérieur.
+    Physique :
+        On dépose un objet chaud (T = T_obj ⇒ T* = 1) dans une pièce
+        initialement à T_amb (T* = 0). La diffusion part de cette
+        condition en créneau (disque ou carré).
+
+        T*(x*, y*, 0) = 1_{ (x*,y*) ∈ objet }
+
+    Parameters
+    ----------
+    x_star, y_star : np.ndarray of shape (n_points,)
+        Coordonnées adimensionnées des points IC.
+    cfg : DataConfig
+        Fournit la géométrie de l'objet (centre, rayon, forme).
+
+    Returns
+    -------
+    T_star : np.ndarray of shape (n_points,)
+        Valeurs dans {0.0, 1.0}.
     """
-    inside = mask_hot_object(
-        x,
-        y,
-        cx=cfg.obj_cx,
-        cy=cfg.obj_cy,
+    # Masque booléen : True = à l'intérieur de l'objet chaud
+    inside_hot_object = mask_hot_object(
+        x_star,
+        y_star,
+        center_x=cfg.obj_cx,
+        center_y=cfg.obj_cy,
         radius=cfg.obj_radius,
         shape=cfg.obj_shape,
     )
-    T = np.zeros(x.shape[0], dtype=np.float64)
-    T[inside] = 1.0
-    return T
 
+    # Par défaut tout le monde est à T* = 0 (pièce ambiante)…
+    T_star = np.zeros(x_star.shape[0], dtype=np.float64)
+
+    # …sauf les points dans l'objet, peints à T* = 1
+    T_star[inside_hot_object] = 1.0
+    return T_star
+
+
+def _points_per_wall(n_bc: int, n_walls: int = 4) -> List[int]:
+    """
+    Répartit n_bc points le plus équitablement possible sur n_walls parois.
+
+    POURQUOI équilibrer ?
+        Chaque paroi impose la même condition Dirichlet T*=0. Si une
+        paroi reçoit beaucoup moins de points, sa contrainte sera
+        sous-représentée dans la loss BC → solution dissymétrique.
+
+    Exemple : n_bc=2000, n_walls=4 → [500, 500, 500, 500]
+    Exemple : n_bc=2003, n_walls=4 → [501, 501, 501, 500]
+              (le reste 2003 % 4 = 3 est distribué aux 3 premières)
+
+    Parameters
+    ----------
+    n_bc : int
+        Budget total de points BC.
+    n_walls : int
+        Nombre de parois (4 pour un carré).
+
+    Returns
+    -------
+    counts : list[int] de longueur n_walls
+        counts[i] = nombre de points alloués à la paroi i.
+    """
+    base_count = n_bc // n_walls
+    remainder = n_bc - base_count * n_walls
+    return [base_count + (1 if wall_index < remainder else 0) for wall_index in range(n_walls)]
+
+
+def _sample_one_wall(
+    wall_id: int,
+    n_points_on_wall: int,
+    method: SamplingMethod,
+    seed: int,
+    t_star_max: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Échantillonne les points d'UNE paroi du carré unité.
+
+    Sur chaque paroi, une coordonnée est FIXÉE (0 ou 1) et l'autre
+    est LIBRE ∈ [0, 1]. Le temps t* est libre dans [0, t*_max].
+
+    Codage des parois :
+        0 → gauche  : x* = 0,  y* libre
+        1 → droite  : x* = 1,  y* libre
+        2 → bas     : y* = 0,  x* libre
+        3 → haut    : y* = 1,  x* libre
+
+    Parameters
+    ----------
+    wall_id : int
+        Indice de paroi ∈ {0, 1, 2, 3}.
+    n_points_on_wall : int
+        Nombre de points à tirer sur cette paroi.
+    method : SamplingMethod
+        Stratégie quasi-aléatoire.
+    seed : int
+        Graine (décalée par paroi dans l'appelant pour diversifier).
+    t_star_max : float
+        Borne haute de Fourier pour scaler t*.
+
+    Returns
+    -------
+    x_star, y_star, t_star, wall_ids : np.ndarray of shape (n_points_on_wall,)
+    """
+    # Tirage 2D dans [0, 1]² : (coordonnée libre, temps unitaire)
+    free_and_time = _sample_in_unit_hypercube(
+        n_points=n_points_on_wall,
+        n_dimensions=2,
+        method=method,
+        seed=seed,
+    )
+    free_coordinate = free_and_time[:, 0]  # ∈ [0, 1]
+    unit_time = free_and_time[:, 1]  # ∈ [0, 1]
+
+    # Scaling du temps vers [0, t*_max]
+    t_star = _scale_unit_time_to_fourier(unit_time, t_star_max)
+
+    # Fixation de la coordonnée de paroi
+    if wall_id == 0:  # gauche : x* = 0
+        x_star = np.zeros(n_points_on_wall, dtype=np.float64)
+        y_star = free_coordinate
+    elif wall_id == 1:  # droite : x* = 1
+        x_star = np.ones(n_points_on_wall, dtype=np.float64)
+        y_star = free_coordinate
+    elif wall_id == 2:  # bas : y* = 0
+        x_star = free_coordinate
+        y_star = np.zeros(n_points_on_wall, dtype=np.float64)
+    elif wall_id == 3:  # haut : y* = 1
+        x_star = free_coordinate
+        y_star = np.ones(n_points_on_wall, dtype=np.float64)
+    else:
+        raise ValueError(f"wall_id invalide : {wall_id}. Attendu dans {{0,1,2,3}}.")
+
+    wall_ids = np.full(n_points_on_wall, wall_id, dtype=np.int64)
+    return x_star, y_star, t_star, wall_ids
+
+
+# ==========================================================================
+# API publique : sample_ic / sample_bc / sample_residual / sample_all
+# ==========================================================================
 
 def sample_ic(
     cfg: Optional[DataConfig] = None,
     method: SamplingMethod = "sobol",
     T_star_init: Optional[float] = None,
-) -> Dict[str, torch.Tensor]:
+) -> CollocationBatch:
     """
-    Échantillonne les points de condition initiale.
+    Échantillonne les points de CONDITION INITIALE (t* = 0).
 
-    À t* = 0 :
-        - T* = 1.0  à l'intérieur de l'objet chaud (disque/carré)
-        - T* = 0.0  à l'extérieur (pièce à T_amb)
+    Physique
+    --------
+    À l'instant initial, on connaît le champ de température partout
+    dans la pièce :
+        - T* = 1  à l'intérieur de l'objet chaud (disque/carré)
+        - T* = 0  à l'extérieur (pièce à température ambiante)
 
-    Si `T_star_init` est fourni (float), ce champ uniforme écrase le
-    masque objet (utile pour des tests unitaires ciblés).
+    Le réseau devra coller à ces valeurs : L_ic = MSE(T_pred, T*_cible).
+
+    Autograd
+    --------
+    x*, y*, t* ont requires_grad=True. Même si à l'Étape 1 on ne
+    dérive pas encore, c'est déjà le format attendu par l'Étape 2
+    (calcul de ∂T*/∂x* etc. si on régularise aussi sur l'IC).
+
+    T*_cible a requires_grad=False : c'est une constante, pas une
+    variable du graphe de calcul.
 
     Parameters
     ----------
     cfg : DataConfig, optional
         Configuration (N_ic, seed, device, géométrie objet…).
+        Si None, on utilise DEFAULT_CONFIG.
     method : {'sobol', 'lhs', 'uniform'}
-        Stratégie d'échantillonnage spatial.
+        Stratégie d'échantillonnage spatial de (x*, y*).
     T_star_init : float, optional
-        Si donné, impose une IC uniforme (ignore l'objet chaud).
+        Si fourni, impose une IC UNIFORME (ignore l'objet chaud).
+        Utile UNIQUEMENT pour des tests unitaires ciblés.
+        En production, laisser None pour activer le masque objet.
 
     Returns
     -------
-    dict with keys
-        x_star : (N_ic, 1)  requires_grad=True
-        y_star : (N_ic, 1)  requires_grad=True
-        t_star : (N_ic, 1)  requires_grad=True  (tout à 0)
-        T_star : (N_ic, 1)  requires_grad=False (cible IC ∈ {0, 1})
+    batch : dict[str, torch.Tensor]
+        "x_star" : shape (N_ic, 1), requires_grad=True
+        "y_star" : shape (N_ic, 1), requires_grad=True
+        "t_star" : shape (N_ic, 1), requires_grad=True,  toutes les valeurs = 0
+        "T_star" : shape (N_ic, 1), requires_grad=False, valeurs ∈ {0, 1}
     """
     cfg = cfg or DEFAULT_CONFIG
     set_seed(cfg.seed)
 
-    xy = _sample_unit(cfg.N_ic, dim=2, method=method, seed=cfg.seed)
-    x = xy[:, 0]
-    y = xy[:, 1]
-    t = np.zeros(cfg.N_ic, dtype=np.float64)
+    n_ic = cfg.N_ic
 
+    # --- 1. Tirage spatial (x*, y*) dans le carré unité ----------------
+    # Shape : (n_ic, 2)
+    xy_unit = _sample_in_unit_hypercube(
+        n_points=n_ic,
+        n_dimensions=2,
+        method=method,
+        seed=cfg.seed,
+    )
+    x_star = xy_unit[:, 0]  # shape (n_ic,)
+    y_star = xy_unit[:, 1]  # shape (n_ic,)
+
+    # --- 2. Temps fixé à 0 (définition même de la condition initiale) --
+    t_star = np.zeros(n_ic, dtype=np.float64)  # shape (n_ic,)
+
+    # --- 3. Température cible selon le masque objet chaud --------------
     if T_star_init is not None:
-        T = np.full(cfg.N_ic, float(T_star_init), dtype=np.float64)
+        # Mode test : champ uniforme imposé
+        T_star = np.full(n_ic, float(T_star_init), dtype=np.float64)
     else:
-        T = _ic_temperature(x, y, cfg)
+        # Mode physique : T*=1 dans l'objet, 0 dehors
+        T_star = _initial_temperature_field(x_star, y_star, cfg)
 
+    # --- 4. Conversion en tenseurs PyTorch (N, 1) ----------------------
     device = cfg.device
     return {
-        "x_star": to_tensor(x, requires_grad=True, device=device),
-        "y_star": to_tensor(y, requires_grad=True, device=device),
-        "t_star": to_tensor(t, requires_grad=True, device=device),
-        "T_star": to_tensor(T, requires_grad=False, device=device),
+        "x_star": to_tensor(x_star, requires_grad=True, device=device),
+        "y_star": to_tensor(y_star, requires_grad=True, device=device),
+        "t_star": to_tensor(t_star, requires_grad=True, device=device),
+        "T_star": to_tensor(T_star, requires_grad=False, device=device),
     }
 
 
@@ -136,95 +392,107 @@ def sample_bc(
     cfg: Optional[DataConfig] = None,
     method: SamplingMethod = "sobol",
     T_star_bc: float = 0.0,
-) -> Dict[str, torch.Tensor]:
+) -> CollocationBatch:
     """
-    Échantillonne les points de conditions aux limites Dirichlet.
+    Échantillonne les points de CONDITIONS AUX LIMITES Dirichlet.
 
-    Les 4 parois du carré [0, 1]² sont peuplées équitablement
-    (N_bc // 4 points chacune, le reste réparti sur les premières parois).
-    Sur chaque paroi : T* = T_star_bc (défaut 0 ⇒ T_amb).
+    Physique
+    --------
+    Les 4 parois de la pièce sont maintenues à T_amb pendant toute la
+    simulation ⇒ en adimensionné : T* = 0 sur ∂Ω, pour tout t* ∈ [0, t*_max].
 
-    Le temps t* est échantillonné dans **[0, t*_max]**, avec
-    t*_max = α t_max / L_ref² (≈ 0.1 pour la config par défaut).
+    C'est une condition de Dirichlet homogène. Le réseau devra coller
+    à T*_pred = 0 sur ces points : L_bc = MSE(T_pred, 0).
 
-    Parois :
-        0 gauche  (x* = 0, y* libre)
-        1 droite  (x* = 1, y* libre)
-        2 bas     (y* = 0, x* libre)
-        3 haut    (y* = 1, x* libre)
+    Répartition
+    -----------
+    Budget N_bc réparti équitablement sur les 4 parois
+    (N_bc // 4 points chacune, reste ventilé sur les premières).
+
+    Temps
+    -----
+    t* est tiré dans [0, t*_max] (PAS [0, 1]) via le scaling Fourier.
 
     Parameters
     ----------
     cfg : DataConfig, optional
+        Configuration (N_bc, t_star_max, seed, device…).
     method : {'sobol', 'lhs', 'uniform'}
-        Utilisé pour (coordonnée libre, t*_unit).
+        Stratégie pour (coordonnée libre, temps unitaire).
     T_star_bc : float
-        Température adimensionnée imposée au bord.
+        Température adimensionnée imposée au bord (défaut 0.0 = T_amb).
 
     Returns
     -------
-    dict with keys
-        x_star, y_star, t_star : (N_bc, 1) requires_grad=True
-        T_star                 : (N_bc, 1) requires_grad=False
-        wall                   : (N_bc, 1) int64, index de paroi {0,1,2,3}
+    batch : dict[str, torch.Tensor]
+        "x_star" : shape (N_bc, 1), requires_grad=True
+        "y_star" : shape (N_bc, 1), requires_grad=True
+        "t_star" : shape (N_bc, 1), requires_grad=True,  valeurs ∈ [0, t*_max]
+        "T_star" : shape (N_bc, 1), requires_grad=False, valeurs = T_star_bc
+        "wall"   : shape (N_bc, 1), dtype=int64,         indices de paroi {0,1,2,3}
     """
     cfg = cfg or DEFAULT_CONFIG
     set_seed(cfg.seed)
 
-    n = cfg.N_bc
-    n_per_wall = n // 4
-    remainder = n - 4 * n_per_wall
-    counts = [n_per_wall + (1 if i < remainder else 0) for i in range(4)]
-    t_max_star = cfg.t_star_max
+    n_bc = cfg.N_bc
+    t_star_max = cfg.t_star_max
+    points_per_wall = _points_per_wall(n_bc, n_walls=4)
 
-    xs, ys, ts, walls = [], [], [], []
-    # Seeds décalées par paroi pour diversifier les sous-échantillons
-    for wall_id, n_wall in enumerate(counts):
-        if n_wall == 0:
+    # Accumulateurs par paroi (listes de tableaux 1-D)
+    x_list: List[np.ndarray] = []
+    y_list: List[np.ndarray] = []
+    t_list: List[np.ndarray] = []
+    wall_list: List[np.ndarray] = []
+
+    for wall_id, n_points_on_wall in enumerate(points_per_wall):
+        if n_points_on_wall == 0:
             continue
-        # 2D sample : coordonnée libre + temps unitaire
-        free_t = _sample_unit(
-            n_wall, dim=2, method=method, seed=cfg.seed + wall_id + 1
+
+        # Graine décalée par paroi → sous-échantillons diversifiés
+        # mais toujours reproductibles à cfg.seed fixé.
+        wall_seed = cfg.seed + wall_id + 1
+
+        x_wall, y_wall, t_wall, wall_ids = _sample_one_wall(
+            wall_id=wall_id,
+            n_points_on_wall=n_points_on_wall,
+            method=method,
+            seed=wall_seed,
+            t_star_max=t_star_max,
         )
-        free_coord = free_t[:, 0]
-        t_coord = _scale_time(free_t[:, 1], t_max_star)  # → [0, t*_max]
+        x_list.append(x_wall)
+        y_list.append(y_wall)
+        t_list.append(t_wall)
+        wall_list.append(wall_ids)
 
-        if wall_id == 0:  # gauche x*=0
-            x_coord = np.zeros(n_wall)
-            y_coord = free_coord
-        elif wall_id == 1:  # droite x*=1
-            x_coord = np.ones(n_wall)
-            y_coord = free_coord
-        elif wall_id == 2:  # bas y*=0
-            x_coord = free_coord
-            y_coord = np.zeros(n_wall)
-        else:  # haut y*=1
-            x_coord = free_coord
-            y_coord = np.ones(n_wall)
+    # Concaténation des 4 parois → shape (n_bc,)
+    x_star = np.concatenate(x_list)
+    y_star = np.concatenate(y_list)
+    t_star = np.concatenate(t_list)
+    wall_ids = np.concatenate(wall_list)
 
-        xs.append(x_coord)
-        ys.append(y_coord)
-        ts.append(t_coord)
-        walls.append(np.full(n_wall, wall_id, dtype=np.int64))
+    # Cible Dirichlet : T* constant sur tout le bord
+    T_star = np.full(n_bc, T_star_bc, dtype=np.float64)
 
-    x = np.concatenate(xs)
-    y = np.concatenate(ys)
-    t = np.concatenate(ts)
-    wall = np.concatenate(walls)
-    T = np.full(n, T_star_bc, dtype=np.float64)
-
-    # Mélange pour éviter un ordre paroi-par-paroi trop structuré
+    # Mélange aléatoire pour casser l'ordre paroi-par-paroi.
+    # POURQUOI ? Si on laisse l'ordre [gauche…, droite…, bas…, haut…],
+    # un mini-batch contigu ne verrait qu'une seule paroi → gradients
+    # biaisés. Le shuffle garantit un mélange i.i.d. approximatif.
     rng = np.random.default_rng(cfg.seed)
-    perm = rng.permutation(n)
-    x, y, t, wall, T = x[perm], y[perm], t[perm], wall[perm], T[perm]
+    permutation = rng.permutation(n_bc)
+    x_star = x_star[permutation]
+    y_star = y_star[permutation]
+    t_star = t_star[permutation]
+    wall_ids = wall_ids[permutation]
+    T_star = T_star[permutation]
 
     device = cfg.device
     return {
-        "x_star": to_tensor(x, requires_grad=True, device=device),
-        "y_star": to_tensor(y, requires_grad=True, device=device),
-        "t_star": to_tensor(t, requires_grad=True, device=device),
-        "T_star": to_tensor(T, requires_grad=False, device=device),
-        "wall": torch.as_tensor(wall, dtype=torch.int64, device=device).unsqueeze(-1),
+        "x_star": to_tensor(x_star, requires_grad=True, device=device),
+        "y_star": to_tensor(y_star, requires_grad=True, device=device),
+        "t_star": to_tensor(t_star, requires_grad=True, device=device),
+        "T_star": to_tensor(T_star, requires_grad=False, device=device),
+        # wall est un indice entier : pas de grad, dtype int64
+        "wall": torch.as_tensor(wall_ids, dtype=torch.int64, device=device).unsqueeze(-1),
     }
 
 
@@ -232,60 +500,118 @@ def sample_residual(
     cfg: Optional[DataConfig] = None,
     method: SamplingMethod = "sobol",
     interior_eps: float = 1e-6,
-) -> Dict[str, torch.Tensor]:
+) -> CollocationBatch:
     """
-    Échantillonne les points de collocation pour le résidu PDE.
+    Échantillonne les points de COLLOCATION pour le résidu PDE.
 
-    - (x*, y*) ∈ ]eps, 1-eps[²  (strictement intérieur spatial)
-    - t*      ∈ ]eps_t, t*_max - eps_t[  avec t*_max = α t_max / L_ref²
+    Physique
+    --------
+    À l'intérieur du domaine spatio-temporel, la solution doit vérifier
+    l'équation de la chaleur adimensionnée :
 
-    L'équation adimensionnée à résidualiser (Étapes suivantes) est :
+        ∂T*/∂t*  −  (∂²T*/∂x*² + ∂²T*/∂y*²)  =  0
 
-        r = ∂T*/∂t* − (∂²T*/∂x*² + ∂²T*/∂y*²)
+    Le résidu r(x*, y*, t*) est exactement le membre de gauche évalué
+    sur la prédiction du réseau. La loss résidu est MSE(r, 0).
+
+    Domaine de tirage
+    -----------------
+        (x*, y*) ∈ (eps, 1 - eps)²          ← strictement intérieur spatial
+        t*      ∈ (eps_t, t*_max - eps_t)  ← strictement intérieur temporel
+
+    POURQUOI strictement intérieur ?
+        - Éviter le double comptage avec l'IC (t*=0) et les BC (bords).
+        - Les dérivées secondes par autograd sont mal définies / bruitées
+          pile sur le bord si la condition Dirichlet y est déjà imposée.
+
+    POURQUOI requires_grad=True sur x*, y*, t* ?
+        C'est ICI que l'autograd est indispensable. À l'Étape 2 on fera :
+
+            T_pred = network(x*, y*, t*)             # shape (N, 1)
+            dT_dt  = grad(T_pred, t*, grad_outputs=ones)[0]   # ∂T*/∂t*
+            dT_dx  = grad(T_pred, x*, ...)[0]                  # ∂T*/∂x*
+            d2T_dx2 = grad(dT_dx, x*, ...)[0]                  # ∂²T*/∂x*²
+            ... idem en y ...
+            residual = dT_dt - (d2T_dx2 + d2T_dy2)
+
+        Sans requires_grad=True sur les entrées, grad(...) lève une erreur.
 
     Parameters
     ----------
     cfg : DataConfig, optional
+        Configuration (N_res, t_star_max, seed, device…).
     method : {'sobol', 'lhs', 'uniform'}
+        Stratégie 3D.
     interior_eps : float
-        Marge relative pour rester strictement intérieur (appliquée
-        spatialement sur [0,1] et temporellement sur [0, t*_max]).
+        Marge relative pour rester strictement intérieur.
+        - spatiale : appliquée sur [0, 1] → [eps, 1-eps]
+        - temporelle : appliquée sur [0, t*_max] → [eps·t*_max, t*_max·(1-eps)]
 
     Returns
     -------
-    dict with keys
-        x_star, y_star, t_star : (N_res, 1) requires_grad=True
+    batch : dict[str, torch.Tensor]
+        "x_star" : shape (N_res, 1), requires_grad=True, ∈ (0, 1)
+        "y_star" : shape (N_res, 1), requires_grad=True, ∈ (0, 1)
+        "t_star" : shape (N_res, 1), requires_grad=True, ∈ (0, t*_max)
+        (pas de "T_star" : le résidu n'a pas de cible Dirichlet)
     """
     cfg = cfg or DEFAULT_CONFIG
     set_seed(cfg.seed)
 
-    raw = _sample_unit(cfg.N_res, dim=3, method=method, seed=cfg.seed + 99)
-    t_max_star = cfg.t_star_max
+    n_res = cfg.N_res
+    t_star_max = cfg.t_star_max
 
-    # Spatial : [0, 1] → [eps, 1-eps]
-    lo_s, hi_s = interior_eps, 1.0 - interior_eps
-    x = lo_s + (hi_s - lo_s) * raw[:, 0]
-    y = lo_s + (hi_s - lo_s) * raw[:, 1]
+    # --- 1. Tirage brut 3D dans [0, 1]³ --------------------------------
+    # Shape : (n_res, 3)  colonnes = (x_unit, y_unit, t_unit)
+    unit_samples = _sample_in_unit_hypercube(
+        n_points=n_res,
+        n_dimensions=3,
+        method=method,
+        seed=cfg.seed + 99,  # décalage pour ne pas corréler avec IC/BC
+    )
 
-    # Temporel : [0, 1] → [eps_t, t*_max - eps_t]
-    # eps_t proportionnel pour rester cohérent quel que soit t*_max
-    eps_t = interior_eps * t_max_star
-    lo_t, hi_t = eps_t, t_max_star - eps_t
-    t = lo_t + (hi_t - lo_t) * raw[:, 2]
+    # --- 2. Scaling spatial : [0, 1] → (eps, 1 - eps) ------------------
+    spatial_lower = interior_eps
+    spatial_upper = 1.0 - interior_eps
+    x_star = spatial_lower + (spatial_upper - spatial_lower) * unit_samples[:, 0]
+    y_star = spatial_lower + (spatial_upper - spatial_lower) * unit_samples[:, 1]
 
+    # --- 3. Scaling temporel : [0, 1] → (eps_t, t*_max - eps_t) --------
+    # eps_t proportionnel à t*_max pour rester cohérent si on change
+    # t_max ou alpha (la marge relative reste interior_eps).
+    time_eps = interior_eps * t_star_max
+    time_lower = time_eps
+    time_upper = t_star_max - time_eps
+    t_star = time_lower + (time_upper - time_lower) * unit_samples[:, 2]
+
+    # --- 4. Conversion en tenseurs avec autograd activé ----------------
     device = cfg.device
     return {
-        "x_star": to_tensor(x, requires_grad=True, device=device),
-        "y_star": to_tensor(y, requires_grad=True, device=device),
-        "t_star": to_tensor(t, requires_grad=True, device=device),
+        "x_star": to_tensor(x_star, requires_grad=True, device=device),
+        "y_star": to_tensor(y_star, requires_grad=True, device=device),
+        "t_star": to_tensor(t_star, requires_grad=True, device=device),
     }
 
 
 def sample_all(
     cfg: Optional[DataConfig] = None,
     method: SamplingMethod = "sobol",
-) -> Dict[str, Dict[str, torch.Tensor]]:
-    """Raccourci : génère IC + BC + résidu d'un coup."""
+) -> Dict[str, CollocationBatch]:
+    """
+    Raccourci : génère IC + BC + résidu d'un seul appel.
+
+    Utile dans un script d'entraînement pour peupler d'un coup
+    tout le dataloader PINN.
+
+    Returns
+    -------
+    bundles : dict
+        {
+          "ic"  : sortie de sample_ic,
+          "bc"  : sortie de sample_bc,
+          "res" : sortie de sample_residual,
+        }
+    """
     cfg = cfg or DEFAULT_CONFIG
     return {
         "ic": sample_ic(cfg, method=method),
