@@ -3,9 +3,16 @@
 
 Trois familles de points (domaine adimensionné) :
 
-1. Condition initiale  (sample_ic)       — t* = 0, (x*, y*) ∈ [0, 1]²
-2. Conditions aux limites (sample_bc)    — 4 parois, T* = 0 (Dirichlet ambiante)
-3. Résidu PDE (sample_residual)          — (x*, y*, t*) ∈ ]0, 1[³
+1. Condition initiale  (sample_ic)
+       t* = 0, (x*, y*) ∈ [0, 1]²
+       T* = 1 à l'intérieur de l'objet chaud, T* = 0 à l'extérieur
+
+2. Conditions aux limites (sample_bc)
+       4 parois, T* = 0 (Dirichlet ambiante)
+       t* ∈ [0, t*_max]   (t*_max = α t_max / L_ref² ≈ 0.1)
+
+3. Résidu PDE (sample_residual)
+       (x*, y*) ∈ ]0, 1[²,  t* ∈ ]0, t*_max[
 
 Chaque fonction retourne un dictionnaire de tenseurs PyTorch. Les
 coordonnées spatiales / temporelles sont créées avec requires_grad=True
@@ -21,7 +28,7 @@ import numpy as np
 import torch
 
 from config import DEFAULT_CONFIG, DataConfig
-from src.utils import latin_hypercube, set_seed, sobol_sample, to_tensor
+from src.utils import latin_hypercube, mask_hot_object, set_seed, sobol_sample, to_tensor
 
 SamplingMethod = Literal["sobol", "lhs", "uniform"]
 
@@ -43,25 +50,57 @@ def _sample_unit(
     raise ValueError(f"Unknown sampling method: {method!r}")
 
 
+def _scale_time(u: np.ndarray, t_max_star: float) -> np.ndarray:
+    """Affine u ∈ [0, 1] → t* ∈ [0, t*_max]."""
+    return u * t_max_star
+
+
+def _ic_temperature(
+    x: np.ndarray,
+    y: np.ndarray,
+    cfg: DataConfig,
+) -> np.ndarray:
+    """
+    Champ T* de condition initiale.
+
+    T* = 1.0 à l'intérieur de l'objet chaud, 0.0 à l'extérieur.
+    """
+    inside = mask_hot_object(
+        x,
+        y,
+        cx=cfg.obj_cx,
+        cy=cfg.obj_cy,
+        radius=cfg.obj_radius,
+        shape=cfg.obj_shape,
+    )
+    T = np.zeros(x.shape[0], dtype=np.float64)
+    T[inside] = 1.0
+    return T
+
+
 def sample_ic(
     cfg: Optional[DataConfig] = None,
     method: SamplingMethod = "sobol",
-    T_star_init: float = 0.0,
+    T_star_init: Optional[float] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Échantillonne les points de condition initiale.
 
-    À t* = 0, le champ de température adimensionné vaut T*_init
-    (par défaut 0 ⇒ pièce à T_amb partout).
+    À t* = 0 :
+        - T* = 1.0  à l'intérieur de l'objet chaud (disque/carré)
+        - T* = 0.0  à l'extérieur (pièce à T_amb)
+
+    Si `T_star_init` est fourni (float), ce champ uniforme écrase le
+    masque objet (utile pour des tests unitaires ciblés).
 
     Parameters
     ----------
     cfg : DataConfig, optional
-        Configuration (N_ic, seed, device…).
+        Configuration (N_ic, seed, device, géométrie objet…).
     method : {'sobol', 'lhs', 'uniform'}
         Stratégie d'échantillonnage spatial.
-    T_star_init : float
-        Valeur de T* imposée sur l'IC (défaut 0.0).
+    T_star_init : float, optional
+        Si donné, impose une IC uniforme (ignore l'objet chaud).
 
     Returns
     -------
@@ -69,7 +108,7 @@ def sample_ic(
         x_star : (N_ic, 1)  requires_grad=True
         y_star : (N_ic, 1)  requires_grad=True
         t_star : (N_ic, 1)  requires_grad=True  (tout à 0)
-        T_star : (N_ic, 1)  requires_grad=False (cible IC)
+        T_star : (N_ic, 1)  requires_grad=False (cible IC ∈ {0, 1})
     """
     cfg = cfg or DEFAULT_CONFIG
     set_seed(cfg.seed)
@@ -78,7 +117,11 @@ def sample_ic(
     x = xy[:, 0]
     y = xy[:, 1]
     t = np.zeros(cfg.N_ic, dtype=np.float64)
-    T = np.full(cfg.N_ic, T_star_init, dtype=np.float64)
+
+    if T_star_init is not None:
+        T = np.full(cfg.N_ic, float(T_star_init), dtype=np.float64)
+    else:
+        T = _ic_temperature(x, y, cfg)
 
     device = cfg.device
     return {
@@ -100,7 +143,9 @@ def sample_bc(
     Les 4 parois du carré [0, 1]² sont peuplées équitablement
     (N_bc // 4 points chacune, le reste réparti sur les premières parois).
     Sur chaque paroi : T* = T_star_bc (défaut 0 ⇒ T_amb).
-    Le temps t* est échantillonné uniformément sur [0, 1].
+
+    Le temps t* est échantillonné dans **[0, t*_max]**, avec
+    t*_max = α t_max / L_ref² (≈ 0.1 pour la config par défaut).
 
     Parois :
         0 gauche  (x* = 0, y* libre)
@@ -112,7 +157,7 @@ def sample_bc(
     ----------
     cfg : DataConfig, optional
     method : {'sobol', 'lhs', 'uniform'}
-        Utilisé pour (coordonnée libre, t*).
+        Utilisé pour (coordonnée libre, t*_unit).
     T_star_bc : float
         Température adimensionnée imposée au bord.
 
@@ -130,18 +175,19 @@ def sample_bc(
     n_per_wall = n // 4
     remainder = n - 4 * n_per_wall
     counts = [n_per_wall + (1 if i < remainder else 0) for i in range(4)]
+    t_max_star = cfg.t_star_max
 
     xs, ys, ts, walls = [], [], [], []
     # Seeds décalées par paroi pour diversifier les sous-échantillons
     for wall_id, n_wall in enumerate(counts):
         if n_wall == 0:
             continue
-        # 2D sample : coordonnée libre + temps
+        # 2D sample : coordonnée libre + temps unitaire
         free_t = _sample_unit(
             n_wall, dim=2, method=method, seed=cfg.seed + wall_id + 1
         )
         free_coord = free_t[:, 0]
-        t_coord = free_t[:, 1]
+        t_coord = _scale_time(free_t[:, 1], t_max_star)  # → [0, t*_max]
 
         if wall_id == 0:  # gauche x*=0
             x_coord = np.zeros(n_wall)
@@ -190,8 +236,8 @@ def sample_residual(
     """
     Échantillonne les points de collocation pour le résidu PDE.
 
-    Points dans le cube ouvert ]eps, 1-eps[³ afin d'éviter le double
-    comptage avec IC (t*=0) et BC (bords spatiaux).
+    - (x*, y*) ∈ ]eps, 1-eps[²  (strictement intérieur spatial)
+    - t*      ∈ ]eps_t, t*_max - eps_t[  avec t*_max = α t_max / L_ref²
 
     L'équation adimensionnée à résidualiser (Étapes suivantes) est :
 
@@ -202,7 +248,8 @@ def sample_residual(
     cfg : DataConfig, optional
     method : {'sobol', 'lhs', 'uniform'}
     interior_eps : float
-        Marge pour rester strictement intérieur.
+        Marge relative pour rester strictement intérieur (appliquée
+        spatialement sur [0,1] et temporellement sur [0, t*_max]).
 
     Returns
     -------
@@ -213,13 +260,18 @@ def sample_residual(
     set_seed(cfg.seed)
 
     raw = _sample_unit(cfg.N_res, dim=3, method=method, seed=cfg.seed + 99)
-    # Affine de [0, 1] → [eps, 1-eps]
-    lo, hi = interior_eps, 1.0 - interior_eps
-    scaled = lo + (hi - lo) * raw
+    t_max_star = cfg.t_star_max
 
-    x = scaled[:, 0]
-    y = scaled[:, 1]
-    t = scaled[:, 2]
+    # Spatial : [0, 1] → [eps, 1-eps]
+    lo_s, hi_s = interior_eps, 1.0 - interior_eps
+    x = lo_s + (hi_s - lo_s) * raw[:, 0]
+    y = lo_s + (hi_s - lo_s) * raw[:, 1]
+
+    # Temporel : [0, 1] → [eps_t, t*_max - eps_t]
+    # eps_t proportionnel pour rester cohérent quel que soit t*_max
+    eps_t = interior_eps * t_max_star
+    lo_t, hi_t = eps_t, t_max_star - eps_t
+    t = lo_t + (hi_t - lo_t) * raw[:, 2]
 
     device = cfg.device
     return {

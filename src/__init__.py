@@ -10,6 +10,7 @@ from src.sampling import sample_bc, sample_ic, sample_residual
 from src.utils import (
     latin_hypercube,
     mask_boundary,
+    mask_hot_object,
     mask_interior,
     sobol_sample,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "sobol_sample",
     "latin_hypercube",
     "mask_boundary",
+    "mask_hot_object",
     "mask_interior",
 ]
 

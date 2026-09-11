@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
 import numpy as np
 import torch
 
@@ -32,7 +33,7 @@ from src.utils import set_seed
 # ---------------------------------------------------------------------------
 
 def validate_ic(ic: dict, cfg: DataConfig) -> None:
-    """Vérifie formes, t*=0 et requires_grad sur les coordonnées IC."""
+    """Vérifie formes, t*=0, T*∈{0,1} (objet chaud) et requires_grad."""
     n = cfg.N_ic
     for key in ("x_star", "y_star", "t_star", "T_star"):
         assert key in ic, f"IC missing key {key}"
@@ -47,14 +48,39 @@ def validate_ic(ic: dict, cfg: DataConfig) -> None:
 
     x = ic["x_star"].detach()
     y = ic["y_star"].detach()
+    T = ic["T_star"].detach()
     assert (x >= 0).all() and (x <= 1).all(), "IC: x* out of [0, 1]"
     assert (y >= 0).all() and (y <= 1).all(), "IC: y* out of [0, 1]"
-    print(f"  [OK] IC  : N={n}, t*=0, T*∈[{ic['T_star'].min():.2f}, {ic['T_star'].max():.2f}]")
+
+    t_min = float(T.min())
+    t_max = float(T.max())
+    # L'objet chaud doit produire T*=1 quelque part, et T*=0 à l'extérieur
+    assert t_min == pytest_approx_zero(t_min), f"IC: expected T* min ≈ 0, got {t_min}"
+    assert t_max == pytest_approx_one(t_max), (
+        f"IC: expected T* max ≈ 1 (hot object), got {t_max}. "
+        "Check obj geometry / sample_ic mask."
+    )
+    n_hot = int((T > 0.5).sum())
+    n_cold = n - n_hot
+    print(
+        f"  [OK] IC  : N={n}, t*=0, T*∈[{t_min:.2f}, {t_max:.2f}]  "
+        f"(hot={n_hot}, cold={n_cold})"
+    )
+
+
+def pytest_approx_zero(v: float, tol: float = 1e-6) -> float:
+    """Helper : renvoie v s'il est ~0, sinon une sentinelle pour faire échouer ==."""
+    return 0.0 if abs(v) <= tol else v
+
+
+def pytest_approx_one(v: float, tol: float = 1e-6) -> float:
+    return 1.0 if abs(v - 1.0) <= tol else v
 
 
 def validate_bc(bc: dict, cfg: DataConfig) -> None:
-    """Vérifie formes, T*=0 et position sur les parois."""
+    """Vérifie formes, T*=0, t*∈[0, t*_max] et position sur les parois."""
     n = cfg.N_bc
+    t_max_star = cfg.t_star_max
     for key in ("x_star", "y_star", "t_star", "T_star"):
         assert key in bc, f"BC missing key {key}"
         assert bc[key].shape == (n, 1), f"BC[{key}] shape {bc[key].shape} != ({n}, 1)"
@@ -68,6 +94,7 @@ def validate_bc(bc: dict, cfg: DataConfig) -> None:
 
     x = bc["x_star"].detach().cpu().numpy().ravel()
     y = bc["y_star"].detach().cpu().numpy().ravel()
+    t = bc["t_star"].detach()
     on_left = np.isclose(x, 0.0)
     on_right = np.isclose(x, 1.0)
     on_bottom = np.isclose(y, 0.0)
@@ -75,28 +102,73 @@ def validate_bc(bc: dict, cfg: DataConfig) -> None:
     on_boundary = on_left | on_right | on_bottom | on_top
     assert on_boundary.all(), "BC: every point must lie on the domain boundary"
 
+    assert (t >= 0).all() and (t <= t_max_star + 1e-9).all(), (
+        f"BC: t* must lie in [0, t*_max={t_max_star}], "
+        f"got [{float(t.min())}, {float(t.max())}]"
+    )
+
     print(
-        f"  [OK] BC  : N={n}, T*=0, "
+        f"  [OK] BC  : N={n}, T*=0, t*∈[{float(t.min()):.4f}, {float(t.max()):.4f}] "
+        f"(t*_max={t_max_star:.4f}), "
         f"walls L/R/B/T = {on_left.sum()}/{on_right.sum()}/{on_bottom.sum()}/{on_top.sum()}"
     )
 
 
 def validate_residual(res: dict, cfg: DataConfig) -> None:
-    """Vérifie formes et appartenance au cube ouvert ]0, 1[³."""
+    """Vérifie formes, (x*,y*)∈(0,1)² et t*∈(0, t*_max)."""
     n = cfg.N_res
+    t_max_star = cfg.t_star_max
     for key in ("x_star", "y_star", "t_star"):
         assert key in res, f"RES missing key {key}"
         assert res[key].shape == (n, 1), f"RES[{key}] shape {res[key].shape} != ({n}, 1)"
         assert res[key].requires_grad, f"RES: {key} must require grad"
-        v = res[key].detach()
-        assert (v > 0).all() and (v < 1).all(), f"RES: {key} must lie in (0, 1)"
 
-    print(f"  [OK] RES : N={n}, points strictly interior to (0,1)³")
+    x = res["x_star"].detach()
+    y = res["y_star"].detach()
+    t = res["t_star"].detach()
+    assert (x > 0).all() and (x < 1).all(), "RES: x* must lie in (0, 1)"
+    assert (y > 0).all() and (y < 1).all(), "RES: y* must lie in (0, 1)"
+    assert (t > 0).all() and (t < t_max_star).all(), (
+        f"RES: t* must lie in (0, t*_max={t_max_star}), "
+        f"got [{float(t.min())}, {float(t.max())}]"
+    )
+
+    print(
+        f"  [OK] RES : N={n}, (x*,y*)∈(0,1)², "
+        f"t*∈[{float(t.min()):.4f}, {float(t.max()):.4f}] (t*_max={t_max_star:.4f})"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Visualisation
 # ---------------------------------------------------------------------------
+
+def _draw_hot_object(ax, cfg: DataConfig) -> None:
+    """Superpose le contour de l'objet chaud sur un axe spatial."""
+    if cfg.obj_shape == "disk":
+        patch = mpatches.Circle(
+            (cfg.obj_cx, cfg.obj_cy),
+            cfg.obj_radius,
+            fill=False,
+            edgecolor="#E45756",
+            linewidth=2,
+            linestyle="--",
+            label=f"Objet chaud (disk r={cfg.obj_radius})",
+        )
+    else:
+        s = 2 * cfg.obj_radius
+        patch = mpatches.Rectangle(
+            (cfg.obj_cx - cfg.obj_radius, cfg.obj_cy - cfg.obj_radius),
+            s,
+            s,
+            fill=False,
+            edgecolor="#E45756",
+            linewidth=2,
+            linestyle="--",
+            label=f"Objet chaud (square r={cfg.obj_radius})",
+        )
+    ax.add_patch(patch)
+
 
 def plot_collocation_points(
     ic: dict,
@@ -107,8 +179,8 @@ def plot_collocation_points(
 ) -> None:
     """
     Figure diagnostic 2×2 :
-        (0,0) nuage (x*, y*) — IC / BC / résidu (sous-échantillon)
-        (0,1) histogramme t* (BC + résidu)
+        (0,0) nuage (x*, y*) — IC coloré par T* / BC / résidu
+        (0,1) histogramme t* (BC + résidu) borné à [0, t*_max]
         (1,0) répartition par paroi (BC)
         (1,1) résumé texte adimensionnement
     """
@@ -119,6 +191,7 @@ def plot_collocation_points(
 
     ic_x = ic["x_star"].detach().cpu().numpy().ravel()
     ic_y = ic["y_star"].detach().cpu().numpy().ravel()
+    ic_T = ic["T_star"].detach().cpu().numpy().ravel()
     bc_x = bc["x_star"].detach().cpu().numpy().ravel()
     bc_y = bc["y_star"].detach().cpu().numpy().ravel()
     bc_t = bc["t_star"].detach().cpu().numpy().ravel()
@@ -131,33 +204,57 @@ def plot_collocation_points(
     fig.suptitle(
         "Étape 1 — Adimensionnement & Échantillonnage\n"
         r"$\partial T^*/\partial t^* = \partial^2 T^*/\partial x^{*2} + \partial^2 T^*/\partial y^{*2}$"
-        f"   |   domaine $(x^*, y^*)\\in[0,1]^2$",
+        f"   |   $t^*\\in[0,\\,t^*_{{\\max}}={cfg.t_star_max:.4f}]$",
         fontsize=13,
         fontweight="bold",
     )
 
-    # --- (0,0) Spatial scatter ---
+    # --- (0,0) Spatial scatter — IC coloré par T* ---
     ax = axes[0, 0]
-    ax.scatter(res_x, res_y, s=2, c="#4C72B0", alpha=0.25, label=f"Résidu (n={n_plot}/{cfg.N_res})")
-    ax.scatter(ic_x, ic_y, s=8, c="#55A868", alpha=0.7, label=f"IC t*=0 (n={cfg.N_ic})")
-    ax.scatter(bc_x, bc_y, s=10, c="#C44E52", alpha=0.8, label=f"BC T*=0 (n={cfg.N_bc})")
+    ax.scatter(res_x, res_y, s=2, c="#4C72B0", alpha=0.20, label=f"Résidu (n={n_plot}/{cfg.N_res})")
+    # IC froid puis chaud pour que le chaud reste visible
+    cold = ic_T < 0.5
+    hot = ~cold
+    ax.scatter(
+        ic_x[cold], ic_y[cold], s=8, c="#55A868", alpha=0.55,
+        label=f"IC T*=0 (n={int(cold.sum())})",
+    )
+    ax.scatter(
+        ic_x[hot], ic_y[hot], s=14, c="#E45756", alpha=0.9,
+        label=f"IC T*=1 objet (n={int(hot.sum())})",
+        zorder=5,
+    )
+    ax.scatter(bc_x, bc_y, s=10, c="#F58518", alpha=0.75, label=f"BC T*=0 (n={cfg.N_bc})")
+    _draw_hot_object(ax, cfg)
     ax.set_xlabel(r"$x^*$")
     ax.set_ylabel(r"$y^*$")
     ax.set_xlim(-0.05, 1.05)
     ax.set_ylim(-0.05, 1.05)
     ax.set_aspect("equal")
     ax.set_title("Points de collocation (projection spatiale)")
-    ax.legend(loc="upper right", fontsize=8, framealpha=0.9)
+    ax.legend(loc="upper right", fontsize=7.5, framealpha=0.9)
     ax.grid(True, alpha=0.3)
 
-    # --- (0,1) Histogramme t* ---
+    # --- (0,1) Histogramme t* borné à [0, t*_max] ---
     ax = axes[0, 1]
-    ax.hist(res_t, bins=40, color="#4C72B0", alpha=0.7, label="Résidu", density=True)
-    ax.hist(bc_t, bins=40, color="#C44E52", alpha=0.6, label="BC", density=True)
+    t_max_star = cfg.t_star_max
+    ax.hist(
+        res_t, bins=40, color="#4C72B0", alpha=0.7, label="Résidu", density=True,
+        range=(0.0, t_max_star),
+    )
+    ax.hist(
+        bc_t, bins=40, color="#F58518", alpha=0.6, label="BC", density=True,
+        range=(0.0, t_max_star),
+    )
     ax.axvline(0.0, color="#55A868", linewidth=2, linestyle="--", label="IC (t*=0)")
+    ax.axvline(
+        t_max_star, color="#E45756", linewidth=2, linestyle=":",
+        label=fr"$t^*_{{\max}}={t_max_star:.4f}$",
+    )
     ax.set_xlabel(r"$t^*$")
     ax.set_ylabel("densité")
-    ax.set_title("Distribution temporelle")
+    ax.set_xlim(0.0, t_max_star * 1.05)
+    ax.set_title(fr"Distribution temporelle  —  $t^*\in[0,\ {t_max_star:.4f}]$")
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -184,26 +281,29 @@ def plot_collocation_points(
     # --- (1,1) Résumé adimensionnement ---
     ax = axes[1, 1]
     ax.axis("off")
+    n_hot = int((ic_T > 0.5).sum())
     summary = (
         "Adimensionnement\n"
         "─────────────────────────────\n"
-        f"  x* = x / Lx          Lx = {cfg.Lx} m\n"
-        f"  y* = y / Ly          Ly = {cfg.Ly} m\n"
-        f"  t* = t / t_max       t_max = {cfg.t_max} s\n"
-        f"  T* = (T − T_amb)/ΔT  ΔT = {cfg.delta_T}°C\n"
+        f"  x* = x / Lx             Lx = {cfg.Lx} m\n"
+        f"  y* = y / Ly             Ly = {cfg.Ly} m\n"
+        f"  t* = α t / L²           t*_max = {cfg.t_star_max:.4f}\n"
+        f"  T* = (T − T_amb)/ΔT     ΔT = {cfg.delta_T}°C\n"
         "\n"
         "Physique\n"
         "─────────────────────────────\n"
         f"  α  = {cfg.alpha:.2e} m²/s\n"
         f"  T_amb = {cfg.T_amb}°C   T_obj = {cfg.T_obj}°C\n"
         f"  t_ref = L²/α = {cfg.t_ref:.1f} s\n"
-        f"  Fo_max = α t_max / L² = {cfg.t_star_max:.4f}\n"
+        f"  t_max = {cfg.t_max} s\n"
+        f"  Objet : {cfg.obj_shape} r={cfg.obj_radius} @ "
+        f"({cfg.obj_cx},{cfg.obj_cy})\n"
         "\n"
         "Échantillonnage\n"
         "─────────────────────────────\n"
-        f"  N_ic  = {cfg.N_ic:>6d}   (t* = 0, T* = 0)\n"
-        f"  N_bc  = {cfg.N_bc:>6d}   (parois, T* = 0)\n"
-        f"  N_res = {cfg.N_res:>6d}   (intérieur)\n"
+        f"  N_ic  = {cfg.N_ic:>6d}   t*=0, T*∈{{0,1}} (hot={n_hot})\n"
+        f"  N_bc  = {cfg.N_bc:>6d}   parois, T*=0, t*≤t*_max\n"
+        f"  N_res = {cfg.N_res:>6d}   intérieur, t*∈(0,t*_max)\n"
         f"  seed  = {cfg.seed}\n"
         "\n"
         "Équation cible (adim.)\n"
@@ -283,6 +383,24 @@ def main() -> int:
         for k, v in bundle.items():
             rg = getattr(v, "requires_grad", False)
             print(f"    {k:8s} shape={tuple(v.shape)}  dtype={v.dtype}  requires_grad={rg}")
+
+    # Bornes t* / T* explicites pour confirmation visuelle dans les logs
+    bc_t = bc["t_star"].detach()
+    res_t = res["t_star"].detach()
+    ic_T = ic["T_star"].detach()
+    print("\n[confirm] Domaines temporels :")
+    print(
+        f"  BC  t* ∈ [{float(bc_t.min()):.6f}, {float(bc_t.max()):.6f}]  "
+        f"(attendu [0, {cfg.t_star_max:.4f}])"
+    )
+    print(
+        f"  RES t* ∈ [{float(res_t.min()):.6f}, {float(res_t.max()):.6f}]  "
+        f"(attendu (0, {cfg.t_star_max:.4f}))"
+    )
+    print(
+        f"  IC  T* ∈ [{float(ic_T.min()):.2f}, {float(ic_T.max()):.2f}]  "
+        f"(attendu [0.00, 1.00])"
+    )
 
     print("\n✓ Étape 1 terminée avec succès.")
     return 0
