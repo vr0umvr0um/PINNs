@@ -6,6 +6,7 @@ Fournit :
     - latin_hypercube   : Latin Hypercube Sampling (LHS)
     - mask_interior     : booléen points strictement intérieurs au carré [0,1]²
     - mask_boundary     : booléen points sur le bord du carré [0,1]²
+    - mask_hot_object   : booléen points à l'intérieur de l'objet chaud
     - set_seed          : reproductibilité NumPy / PyTorch
 """
 
@@ -163,6 +164,41 @@ def mask_boundary(
     return in_box & (on_x | on_y)
 
 
+def mask_hot_object(
+    x: np.ndarray,
+    y: np.ndarray,
+    cx: float = 0.5,
+    cy: float = 0.5,
+    radius: float = 0.15,
+    shape: str = "disk",
+) -> np.ndarray:
+    """
+    Masque booléen des points situés à l'intérieur de l'objet chaud.
+
+    Parameters
+    ----------
+    x, y : ndarray
+        Coordonnées adimensionnées (même shape).
+    cx, cy : float
+        Centre de l'objet (x*, y*).
+    radius : float
+        Rayon (disk) ou demi-côté (square).
+    shape : {'disk', 'square'}
+        Géométrie de l'objet.
+
+    Returns
+    -------
+    mask : ndarray of bool — True = à l'intérieur de l'objet (T* = 1)
+    """
+    dx = np.asarray(x, dtype=np.float64) - cx
+    dy = np.asarray(y, dtype=np.float64) - cy
+    if shape == "disk":
+        return (dx * dx + dy * dy) <= radius**2
+    if shape == "square":
+        return (np.abs(dx) <= radius) & (np.abs(dy) <= radius)
+    raise ValueError(f"Unknown object shape: {shape!r}")
+
+
 def which_boundary(
     x: np.ndarray,
     y: np.ndarray,
@@ -218,6 +254,7 @@ __all__ = [
     "latin_hypercube",
     "mask_interior",
     "mask_boundary",
+    "mask_hot_object",
     "which_boundary",
     "to_tensor",
     "unit_cube_bounds",
