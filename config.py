@@ -46,6 +46,14 @@ from typing import Literal, Tuple
 # "square" → carré de demi-côté obj_radius centré idem
 ObjectShape = Literal["disk", "square"]
 
+# Fonctions d'activation autorisées pour le PINN.
+# CONTRAINTE FONDAMENTALE : l'activation doit être DEUX FOIS dérivable
+# (classe C²), car le résidu PDE contient ∂²T*/∂x*² et ∂²T*/∂y*².
+# C'est pourquoi ReLU est volontairement ABSENTE de cette liste :
+# sa dérivée seconde est identiquement nulle → le laplacien prédit
+# vaudrait 0 partout et le PINN ne pourrait jamais apprendre la diffusion.
+Activation = Literal["tanh", "sin", "gelu", "softplus"]
+
 
 @dataclass
 class DataConfig:
@@ -364,7 +372,129 @@ class DataConfig:
         return "\n".join(lines)
 
 
-# Instance par défaut, importable partout :
-#   from config import DEFAULT_CONFIG
-# Évite de recréer DataConfig() à chaque appel si on ne customisera rien.
+@dataclass
+class ModelConfig:
+    """
+    Hyperparamètres d'ARCHITECTURE du réseau T_θ(x*, y*, t*)  — Étape 2.
+
+    POURQUOI séparer de DataConfig ?
+        DataConfig décrit la PHYSIQUE (elle ne change pas quand on teste
+        un réseau plus profond). ModelConfig décrit le MODÈLE (il change
+        à chaque expérience). Les garder distincts permet de balayer des
+        architectures sans jamais toucher aux constantes physiques.
+    """
+
+    # ------------------------------------------------------------------
+    # Topologie du MLP
+    # ------------------------------------------------------------------
+    # Entrée : 3 features (x*, y*, t*) — Sortie : 1 scalaire (T*).
+    # Un MLP "4 couches × 64 neurones" est le point de départ classique
+    # de la littérature PINN pour une EDP 2D+temps : assez expressif pour
+    # capturer la diffusion, assez petit pour entraîner sur CPU.
+    n_hidden_layers: int = 4  # nombre de couches cachées
+    n_neurons: int = 64  # largeur de chaque couche cachée
+
+    # ------------------------------------------------------------------
+    # Non-linéarité
+    # ------------------------------------------------------------------
+    # tanh : choix de référence en PINN. Lisse (C^∞), bornée, et sa
+    # dérivée seconde est non triviale → le laplacien autograd est correct.
+    activation: Activation = "tanh"
+
+    # Pulsation des activations sinusoïdales (utilisée seulement si
+    # activation="sin", architecture de type SIREN). ω=30 est la valeur
+    # recommandée par l'article SIREN pour des entrées normalisées [-1, 1].
+    sine_omega: float = 30.0
+
+    # ------------------------------------------------------------------
+    # Normalisation des entrées
+    # ------------------------------------------------------------------
+    # POURQUOI normaliser alors qu'on a DÉJÀ adimensionné ?
+    #     L'adimensionnement met x*, y* ∈ [0, 1] mais t* ∈ [0, 0.1].
+    #     Le temps est donc 10× plus "petit" que l'espace : le réseau
+    #     verrait une entrée quasi constante et les poids associés à t*
+    #     recevraient des gradients ridiculement faibles.
+    #     On applique donc une transformation affine FIXE (pas apprise)
+    #     qui envoie chaque entrée sur [-1, 1], la zone où tanh est
+    #     la plus sensible (dérivée maximale en 0).
+    #
+    # IMPORTANT (piège autograd) : cette normalisation interne ne change
+    # RIEN au calcul du résidu. Autograd dérive la sortie par rapport au
+    # tenseur t* FOURNI en entrée, et applique la règle de la chaîne à
+    # travers la normalisation. On obtient bien ∂T*/∂t* au sens de Fourier.
+    normalize_inputs: bool = True
+
+    # ------------------------------------------------------------------
+    # Initialisation des poids
+    # ------------------------------------------------------------------
+    # Glorot/Xavier : maintient la variance du signal constante d'une
+    # couche à l'autre → évite l'explosion/extinction des gradients
+    # dès l'initialisation, ce qui est critique quand on dérive DEUX fois.
+    init_gain: float = 1.0
+
+    # Graine dédiée à l'initialisation des poids (indépendante de celle
+    # de l'échantillonnage → on peut rejouer le même nuage de points
+    # avec un tirage de poids différent, et inversement).
+    seed: int = 42
+
+    def summary(self) -> str:
+        """Résumé textuel de l'architecture (affiché par main_step2)."""
+        lines = [
+            "=" * 60,
+            "  ModelConfig — architecture T_θ(x*, y*, t*)",
+            "=" * 60,
+            f"  Entrées        : 3 (x*, y*, t*)  →  Sortie : 1 (T*)",
+            f"  Couches cachées: {self.n_hidden_layers} × {self.n_neurons} neurones",
+            f"  Activation     : {self.activation}"
+            + (f" (ω={self.sine_omega})" if self.activation == "sin" else ""),
+            f"  Normalisation  : {'[-1, 1] affine fixe' if self.normalize_inputs else 'désactivée'}",
+            f"  Init           : Xavier/Glorot (gain={self.init_gain}), seed={self.seed}",
+            "=" * 60,
+        ]
+        return "\n".join(lines)
+
+
+@dataclass
+class LossConfig:
+    """
+    Pondérations de la loss multi-objectif du PINN — Étape 2.
+
+        L(θ) = w_ic · L_ic  +  w_bc · L_bc  +  w_res · L_res
+
+    POURQUOI pondérer ?
+        Les trois termes n'ont ni la même échelle ni la même difficulté.
+        L_ic doit capturer un CRÉNEAU discontinu (l'objet chaud) : c'est
+        le terme le plus raide. L_res porte sur des dérivées secondes,
+        numériquement plus bruitées. Sans pondération, l'optimiseur peut
+        « satisfaire » le résidu avec la solution triviale T* ≡ 0, qui
+        vérifie parfaitement l'EDP et les BC, mais rate l'IC.
+
+    NOTE POUR L'ÉTAPE 3
+        On garde ici des poids STATIQUES et neutres (1/1/1) : l'Étape 2
+        ne fait que DÉFINIR la loss, pas l'optimiser. La pondération
+        dynamique (et le Residual Adaptive Resampling) sont explicitement
+        au programme de l'Étape 3.
+    """
+
+    w_ic: float = 1.0  # poids de la condition initiale
+    w_bc: float = 1.0  # poids des conditions aux limites (Dirichlet)
+    w_res: float = 1.0  # poids du résidu PDE
+
+    def as_tuple(self) -> Tuple[float, float, float]:
+        """Triplet (w_ic, w_bc, w_res), pratique pour le logging."""
+        return (self.w_ic, self.w_bc, self.w_res)
+
+    def summary(self) -> str:
+        """Résumé textuel des pondérations."""
+        return (
+            f"LossConfig : L = {self.w_ic}·L_ic + "
+            f"{self.w_bc}·L_bc + {self.w_res}·L_res"
+        )
+
+
+# Instances par défaut, importables partout :
+#   from config import DEFAULT_CONFIG, DEFAULT_MODEL_CONFIG, DEFAULT_LOSS_CONFIG
+# Évite de recréer les dataclasses à chaque appel si on ne customisera rien.
 DEFAULT_CONFIG = DataConfig()
+DEFAULT_MODEL_CONFIG = ModelConfig()
+DEFAULT_LOSS_CONFIG = LossConfig()
