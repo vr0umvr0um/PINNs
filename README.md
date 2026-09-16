@@ -17,10 +17,12 @@ avec $(x^*, y^*) \in [0,1]^2$, $t^* \in [0,\ t^*_{\max}]$, $T^* \in [0,1]$.
 
 > **Pédagogie / soutenance** — chaque module (`config.py`, `src/utils.py`,
 > `src/sampling.py`, `src/models.py`, `src/physics.py`, `src/losses.py`,
-> `main_step1.py`, `main_step2.py`) documente en français le *pourquoi*
+> `src/trainer.py`, `main_step1.py`, `main_step2.py`, `main_step3.py`)
+> documente en français le *pourquoi*
 > physique ou mathématique de chaque bloc (adimensionnement Fourier,
 > `create_graph=True` pour les dérivées secondes, activation $C^2$
-> obligatoire, piège de la solution triviale, etc.), pas seulement
+> obligatoire, piège de la solution triviale, closure L-BFGS, etc.),
+> pas seulement
 > le *comment*. Les shapes des tenseurs sont systématiquement indiquées
 > sous la forme `(N, 1) = (batch_size, n_features)`.
 
@@ -34,21 +36,24 @@ PINNs/
 ├── README.md
 ├── requirements.txt
 ├── pytest.ini
-├── config.py              # DataConfig (physique) + ModelConfig + LossConfig
+├── config.py              # DataConfig (physique) + ModelConfig + LossConfig + TrainConfig
 ├── main_step1.py          # Étape 1 — génération, validation, export figure
 ├── main_step2.py          # Étape 2 — réseau, autograd, loss, export figure
+├── main_step3.py          # Étape 3 — entraînement hybride Adam → L-BFGS
 ├── src/
 │   ├── __init__.py
-│   ├── utils.py           # Sobol / LHS, masques géométriques, to_tensor
+│   ├── utils.py           # Sobol / LHS, masques, get_device, checkpoints, plots
 │   ├── sampling.py        # sample_ic, sample_bc, sample_residual
 │   ├── models.py          # PINN : MLP à activations C², normalisation [-1,1]
 │   ├── physics.py         # autograd, résidu PDE, solution analytique
-│   └── losses.py          # L = w_ic·L_ic + w_bc·L_bc + w_res·L_res
+│   ├── losses.py          # L = w_ic·L_ic + w_bc·L_bc + w_res·L_res
+│   └── trainer.py         # PINNTrainer : Adam + scheduler → L-BFGS, suivi, checkpoints
 └── tests/
     ├── test_sampling.py   # Invariants Étape 1
     ├── test_models.py     # Architecture (Étape 2)
     ├── test_physics.py    # Autograd & résidu (Étape 2)
-    └── test_losses.py     # Loss multi-objectif (Étape 2)
+    ├── test_losses.py     # Loss multi-objectif (Étape 2)
+    └── test_trainer.py    # Boucle hybride, early stopping, checkpoints (Étape 3)
 ```
 
 ---
@@ -113,7 +118,8 @@ source venv/bin/activate          # Windows : venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-**Dépendances** : `torch`, `numpy`, `matplotlib`, `scipy`, `gradio`, `pytest`.
+**Dépendances** : `torch`, `numpy`, `matplotlib`, `scipy`, `gradio`, `pytest`,
+`tqdm` (+ `tensorboard` optionnel pour la visualisation des courbes).
 
 ---
 
@@ -277,13 +283,108 @@ C'est exactement ce qui motive la **pondération dynamique de l'Étape 3**.
 
 ---
 
+## Étape 3 — Entraînement hybride Adam → L-BFGS
+
+```bash
+python main_step3.py            # run nominal : 5 000 epochs Adam → 500 itérations L-BFGS
+python main_step3.py --test     # run court de validation : 500 + 50, budgets réduits
+```
+
+> **Commencer par `--test`** : ce mode réduit les budgets
+> (500 epochs Adam + 50 itérations L-BFGS, échantillons 500/500/2000)
+> et ajoute un **bilan mémoire** (RSS avant/après, VRAM restituée,
+> historique sans tenseur PyTorch) — de quoi prouver l'absence de bugs
+> et de fuite avant d'engager un run long.
+
+### Pourquoi deux phases ?
+
+| Phase | Optimiseur | Rôle | Limite |
+|-------|-----------|------|--------|
+| 1 | `Adam` + scheduler (`ReduceLROnPlateau` ou `CosineAnnealingLR`) | Exploration robuste : tolère les gradients raides des dérivées secondes, s'échappe des mauvais bassins | Oscille autour du minimum (plafond ~1e-4/1e-5), ne s'y installe jamais |
+| 2 | `L-BFGS` (`line_search_fn='strong_wolfe'`) | Affinage quasi-Newton : mémoire des courbures passées → convergence quasi exacte | Trompeur loin du minimum — d'où l'ordre **Adam puis L-BFGS** |
+
+Deux règles non négociables, implémentées dans `src/trainer.py` :
+
+- **La closure L-BFGS** : `optimizer.step(closure)` exige une fonction qui
+  remet les gradients à zéro, recalcule la loss (la line search évalue
+  plusieurs points d'essai), lance `backward()` et **renvoie** la loss.
+- **Full-batch obligatoire** : L-BFGS mémorise une courbure *entre* deux
+  évaluations — tout mini-batch aléatoire casserait sa mémoire et sa
+  line search. Le run est de plus déterministe à seed fixée.
+
+### Pondération des pertes (configurable)
+
+| Schéma | Formule | Notes |
+|--------|---------|-------|
+| `fixed` (défaut) | $w_{ic}, w_{bc}, w_{res}$ de `LossConfig` | Référence reproductible |
+| `grad_norm` | $w_i \propto 1/\lVert\nabla_\theta \mathcal{L}_i\rVert_2$, normalisé (max = 1) | Équilibre les tirages ; le résidu dominant est dégonflé (esprit GradNorm) |
+| `lr_annealing` | $w_i \propto \hat{w}_i^{-1}$ avec $\hat{w}_i = \max_\theta\lvert\nabla_\theta \mathcal{L}_i\rvert / \mathrm{mean}_\theta\lvert\nabla_\theta \mathcal{L}_i\rvert$ sur la 1ʳᵉ couche | Wang, Teng & Perdikaris (ICML 2021) |
+
+Les facteurs adaptatifs se multiplient aux poids statiques
+($w_{eff} = w_{config} \times w_{adaptatif}$), se mettent à jour toutes
+les `weighting_update_every` epochs (après un `warmup` optionnel) et sont
+**gelés pendant L-BFGS** : un quasi-Newton exige un objectif stationnaire.
+
+```bash
+python main_step3.py --weighting grad_norm
+python main_step3.py --weighting lr_annealing --weighting-every 50 --weighting-warmup 200
+python main_step3.py --w-ic 10 --w-bc 10 --w-res 1        # poids fixes
+```
+
+### Suivi, checkpoints, early stopping
+
+| Artefact | Contenu |
+|----------|---------|
+| `checkpoints/best_model.pt` | Poids + optimiseurs au **record** de la métrique surveillée (`total` ou `residual`) |
+| `checkpoints/last_model.pt` | Idem + scheduler + historique complet — écrit périodiquement (`checkpoint_every`) et en fin de run |
+| `checkpoints/history.json` | Historique complet (JSON) pour post-mortem |
+| `step3_training_losses.png` | Figure 2×2 : perte totale (log), termes bruts, poids effectifs, lr |
+
+L'historique enregistre à chaque itération : $\mathcal{L}_{ic}$,
+$\mathcal{L}_{bc}$, $\mathcal{L}_{res}$, $\mathcal{L}_{total}$, les poids
+effectifs, le lr et le temps écoulé — **uniquement en floats Python**
+(stocker des tenseurs y retiendrait les graphes autograd → fuite mémoire
+garantie). Progression **tqdm** par défaut, **TensorBoard** en option
+(`--tensorboard`, puis `tensorboard --logdir runs/`).
+
+L'**early stopping** (patience, min_delta, métrique au choix) coupe le run
+si la métrique n'améliore plus ; un garde-fou restaure le meilleur
+checkpoint et arrête proprement en cas de NaN ou d'échec de line search.
+
+### Logs attendus (`--test`)
+
+```
+[adam     1/500] L=1.253e+01 | ic=1.36e-01 bc=3.32e-02 res=1.24e+01 | w=(1.00,1.00,1.00) | lr=1.00e-03 | t+0.1 s
+[adam   500/500] L=6.655e-02 | ic=6.53e-02 bc=1.01e-03 res=2.48e-04 | w=(1.00,1.00,1.00) | lr=1.00e-03 | t+24.8 s
+[lbfgs    1/50] L=6.462e-02 | ic=6.22e-02 bc=3.98e-04 res=2.05e-03 | evals=23 | t+26.0 s
+[lbfgs   50/50] L=3.949e-02 | ic=3.64e-02 bc=6.91e-04 res=2.44e-03 | evals=1134 | t+1 min 21 s
+```
+
+Lecture : Adam écrase d'abord le résidu (12.4 → 2.5e-4) ; il reste alors le
+terme raide $\mathcal{L}_{ic}$ (le créneau de l'objet chaud), que L-BFGS
+raffine (6.7e-2 → 3.9e-2). Le compteur `evals` rappelle le vrai coût de
+L-BFGS : chaque itération évalue la closure plusieurs fois (line search).
+
+### Tests
+
+```bash
+pytest tests/ -v        # 143 tests, dont 25 dédiés à l'Étape 3
+```
+
+`tests/test_trainer.py` verrouille : exécution des deux phases, historique
+sans tenseur (anti-fuite), `best_model.pt` = minimum de la métrique,
+déclenchement de l'early stopping, bornes et normalisation des poids
+adaptatifs, scheduler, roundtrip de checkpoint, figure.
+
+---
+
 ## Roadmap
 
 | Étape | Contenu | Statut |
 |-------|---------|--------|
 | **1** | Adimensionnement & échantillonnage IC/BC/résidu | ✅ |
 | **2** | Architecture du réseau & loss PINN (autograd) | ✅ |
-| **3** | Entraînement & checkpoints | 🔜 |
+| **3** | Entraînement hybride Adam → L-BFGS, checkpoints | ✅ |
 | **4** | Démonstrateur interactif Gradio | 🔜 |
 | **5** | Présentation (5 min) | 🔜 |
 
@@ -292,11 +393,13 @@ C'est exactement ce qui motive la **pondération dynamique de l'Étape 3**.
 ## Configuration rapide
 
 ```python
-from config import DataConfig, ModelConfig, LossConfig
+from config import DataConfig, ModelConfig, LossConfig, TrainConfig
 from src.sampling import sample_ic, sample_bc, sample_residual
 from src.models import PINN
 from src.physics import pde_residual
 from src.losses import pinn_loss
+from src.trainer import PINNTrainer
+from src.utils import get_device
 
 cfg = DataConfig()          # Lx=Ly=1, alpha=2e-5, N_ic=2000, t*_max=0.1, …
 print(cfg.summary())
@@ -313,6 +416,18 @@ r = pde_residual(model, res["x_star"], res["y_star"], res["t_star"])  # (N_res, 
 terms = pinn_loss(model, ic, bc, res, LossConfig(w_ic=1.0, w_bc=1.0, w_res=1.0))
 print(terms)                # L=…  |  L_ic=…  L_bc=…  L_res=…
 terms.total.backward()      # ∂L/∂θ prêt pour l'optimiseur de l'Étape 3
+
+# --- Étape 3 : entraînement hybride Adam → L-BFGS ---
+trainer = PINNTrainer(
+    model, ic, bc, res,
+    LossConfig(w_ic=1.0, w_bc=1.0, w_res=1.0),
+    TrainConfig(adam_epochs=5000, lbfgs_iterations=500, weighting="fixed"),
+    device=get_device("auto"),          # cuda > mps > cpu
+    checkpoint_dir="checkpoints",
+)
+result = trainer.fit()                  # FitResult : record, checkpoints, arrêt…
+print(result.summary())
+trainer.restore_best_weights()          # revenir au best_model.pt
 ```
 
 ---

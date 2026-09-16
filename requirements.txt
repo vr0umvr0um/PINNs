@@ -4,3 +4,8 @@ matplotlib>=3.7.0
 scipy>=1.10.0
 gradio>=4.0.0
 pytest>=7.4.0
+tqdm>=4.66.0
+
+# Optionnel — visualisation TensorBoard des courbes d'entraînement (Étape 3).
+# Décommenter pour activer `python main_step3.py --tensorboard` :
+# tensorboard>=2.14.0
