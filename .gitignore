@@ -1,0 +1,58 @@
+# Virtual environments
+venv/
+.venv/
+env/
+.env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Checkpoints & model artifacts
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# Generated figures / images
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Data exports (keep structure, ignore large dumps)
+data/raw/
+data/processed/
+*.npy
+*.npz
+
+# Logs
+logs/
+*.log
+wandb/
+runs/
