@@ -39,7 +39,7 @@ Condition initiale physique :
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Tuple
+from typing import Literal, Optional, Tuple
 
 # Forme géométrique de l'objet chaud à t* = 0.
 # "disk"   → disque de rayon obj_radius centré en (obj_cx, obj_cy)
@@ -492,9 +492,272 @@ class LossConfig:
         )
 
 
+# ==========================================================================
+# Étape 3 — stratégies d'entraînement
+# ==========================================================================
+
+# Stratégie de pondération des trois termes de la loss.
+#   "fixed"        : poids statiques de LossConfig (référence, reproductible).
+#   "grad_norm"    : w_i ∝ 1/‖∇_θ L_i‖₂  — équilibre les NORMES DE GRADIENTS
+#                    des trois termes (inspiré de GradNorm, Chen et al. 2018,
+#                    appliqué aux PINNs). Le terme dominant (ici L_res,
+#                    cf. bilan de l'Étape 2) est dégonflé, les termes
+#                    étouffés (L_ic, L_bc) sont remontés.
+#   "lr_annealing" : Wang, Teng & Perdikaris (ICML 2021) — statistique
+#                    max|∇_θ L_i| / mean|∇_θ L_i| calculée sur la PREMIÈRE
+#                    couche : elle mesure le caractère « pointu » (mal
+#                    conditionné) du gradient de chaque terme ; le pas
+#                    effectif du terme pathologique est annealé vers le bas.
+#
+# Dans les deux schémas adaptatifs, les facteurs sont normalisés pour que
+# le plus grand vale 1 (les poids restent bornés, la loss totale ne
+# divergent pas en échelle), puis MULTIPLIÉS par les poids statiques de
+# LossConfig : w_effectif = w_config × w_adaptatif.
+WeightingScheme = Literal["fixed", "grad_norm", "lr_annealing"]
+
+# Scheduler du learning rate pour la phase Adam.
+#   "plateau" : ReduceLROnPlateau — divise le lr quand la loss stagne.
+#   "cosine"  : CosineAnnealingLR — décroissance douce jusqu'à min_lr.
+#   "none"    : lr constant.
+SchedulerKind = Literal["plateau", "cosine", "none"]
+
+# Métrique surveillée par l'early stopping et par le checkpoint "best".
+#   "total"    : perte totale pondérée (l'objectif réellement minimisé).
+#   "residual" : résidu EDP seul ( pertinent si l'on veut avant tout une
+#               solution physiquement fidèle, au prix des BC/IC).
+EarlyStopMonitor = Literal["total", "residual"]
+
+
+@dataclass
+class TrainConfig:
+    """
+    Hyperparamètres de la BOUCLE D'ENTRAÎNEMENT hybride — Étape 3.
+
+        Phase 1 : Adam (exploration robuste, scheduler de lr)
+        Phase 2 : L-BFGS (affinage quasi-Newton, line search strong_wolfe)
+
+    POURQUOI DEUX PHASES ADAM → L-BFGS ?
+        Adam normalise son pas par une moyenne mobile des gradients : il
+        tolère les gradients raides des dérivées secondes du résidu et
+        s'échappe des mauvais bassins — mais il OSCILLE indéfiniment
+        autour du minimum sans jamais s'y installer (plafond ~1e-4/1e-5
+        sur la loss). L-BFGS reconstruit une approximation inverse de la
+        Hessienne à partir des dernières paires (pas, Δgradient) : son pas
+        devient de plus en plus pertinent près du minimum → convergence
+        quasi exacte. En contrepartie, loin du minimum son modèle de
+        courbure est trompeur. D'où la séquence Adam PUIS L-BFGS —
+        jamais l'inverse.
+
+    POURQUOI FULL-BATCH (aucun mini-batch) ?
+        L-BFGS mémorise une courbure ENTRE deux évaluations de la loss.
+        Si l'objectif changeait entre deux appels de closure (mini-batchs
+        aléatoires), la mémoire de courbure deviendrait incohérente et la
+        line search échouerait. Tout le budget (N_ic, N_bc, N_res) est
+        donc évalué à chaque itération ; l'entraînement est de plus
+        parfaitement déterministe à seed fixée.
+
+    POURQUOI PAS D'AMP (mixed precision) ?
+        Le résidu exige une DOUBLE dérivation (backward du backward).
+        En float16, les dérivées secondes saturent et produisent des NaN
+        systématiques ; torch.autograd.grad n'est de toute façon pas
+        couvert par GradScaler. Le projet reste en float32 : le modèle
+        (~13k paramètres) est petit, le gain AMP serait négligeable.
+
+    NOTE SUR LA PONDÉRATION DYNAMIQUE PENDANT L-BFGS
+        L-BFGS minimise un objectif FIXE : changer w_ic/w_bc/w_res en
+        cours de phase reviendrait à déplacer la cible sous les pieds de
+        l'optimiseur et invaliderait sa mémoire de courbure. Les schémas
+        adaptatifs s'appliquent donc pendant la phase Adam UNIQUEMENT ;
+        la phase L-BFGS hérite des poids effectifs du dernier pas Adam.
+    """
+
+    # ------------------------------------------------------------------
+    # Phase 1 — Adam (exploration)
+    # ------------------------------------------------------------------
+    # 5 000 epochs est un bon compromis CPU/GPU pour ce problème : assez
+    # pour installer la structure de la solution, sans gaspiller du temps
+    # là où L-BFGS sera de toute façon bien plus efficace.
+    adam_epochs: int = 5000
+    adam_lr: float = 1e-3  # lr nominal d'Adam (1e-3 : valeur par défaut robuste)
+    # Clipping global optionnel de la norme du gradient (None = désactivé ;
+    # Xavier + tanh rendent le clipping généralement inutile ici).
+    adam_clip_grad_norm: Optional[float] = None
+
+    # Scheduler de lr : ReduceLROnPlateau par défaut, car on ne connaît
+    # pas d'avance le "bon" nombre d'epochs — il s'adapte à la loss.
+    scheduler: SchedulerKind = "plateau"
+    scheduler_factor: float = 0.5  # division du lr en cas de stagnation
+    scheduler_patience: int = 500  # epochs sans améliration avant division
+    scheduler_min_lr: float = 1e-6  # plancher du lr
+
+    # ------------------------------------------------------------------
+    # Phase 2 — L-BFGS (affinage)
+    # ------------------------------------------------------------------
+    # "itération" L-BFGS = UN appel à optimizer.step(closure), qui peut
+    # lui-même évaluer la closure jusqu'à max_iter fois (line search).
+    lbfgs_iterations: int = 500  # appels externes à step()
+    lbfgs_lr: float = 1.0  # pas initial (les quasi-Newton s'autocalibrent)
+    lbfgs_max_iter: int = 20  # itérations internes max par appel à step()
+    lbfgs_history_size: int = 50  # paires (s, y) mémorisées pour la courbure
+    lbfgs_tolerance_grad: float = 1e-9  # ‖∇L‖ < tol → arrêt interne
+    lbfgs_tolerance_change: float = 1e-12  # |Δf| < tol → arrêt interne
+    lbfgs_line_search_fn: Optional[Literal["strong_wolfe"]] = "strong_wolfe"
+
+    # ------------------------------------------------------------------
+    # Pondération dynamique des pertes
+    # ------------------------------------------------------------------
+    weighting: WeightingScheme = "fixed"
+    # Mise à jour des facteurs adaptatifs toutes les N epochs Adam
+    # (chaque mise à jour coûte 3 backward supplémentaires : garder N ≥ 50
+    # pour un surcoût < 5 %).
+    weighting_update_every: int = 100
+    # Epochs Adam pendant lesquelles les poids restent ceux de la config
+    # (laisser les transitoires d'initialisation passer).
+    weighting_warmup: int = 0
+    # Garde-fou numérique des divisions (normes de gradients quasi nulles).
+    weighting_eps: float = 1e-8
+
+    # ------------------------------------------------------------------
+    # Early stopping
+    # ------------------------------------------------------------------
+    # Filet de sécurité budgétaire : si la métrique surveillée n'améliore
+    # pas de plus de es_min_delta pendant es_patience itérations
+    # CONSÉCUTIVES SANS RECORD (Adam + L-BFGS cumulés), on stoppe net.
+    early_stopping: bool = True
+    es_monitor: EarlyStopMonitor = "total"
+    es_patience: int = 1500
+    es_min_delta: float = 0.0  # amélioration minimale absolue pour compter
+
+    # ------------------------------------------------------------------
+    # Logging & checkpoints
+    # ------------------------------------------------------------------
+    log_every: int = 100  # affichage terminal : 1 epoch Adam sur log_every
+    lbfgs_log_every: int = 10  # affichage : 1 itération L-BFGS sur N
+    checkpoint_every: int = 1000  # écriture de last_model.pt toutes les N itérations
+
+    # ==================================================================
+    # Validation & affichage
+    # ==================================================================
+
+    def __post_init__(self) -> None:
+        """
+        Vérifie la cohérence des hyperparamètres.
+
+        POURQUOI valider ici plutôt qu'au milieu de l'entraînement ?
+            Une erreur d'hyperparamètre détectée à l'epoch 3 000 gaspille
+            des heures de calcul. Tout contrôler à la construction
+            garantit l'échec immédiat, bruyant et explicite.
+        """
+        if self.adam_epochs < 0:
+            raise ValueError(f"adam_epochs doit être ≥ 0, reçu {self.adam_epochs}.")
+        if self.lbfgs_iterations < 0:
+            raise ValueError(
+                f"lbfgs_iterations doit être ≥ 0, reçu {self.lbfgs_iterations}."
+            )
+        if self.adam_lr <= 0.0 or self.lbfgs_lr <= 0.0:
+            raise ValueError(
+                f"Les lr doivent être > 0, reçu adam_lr={self.adam_lr}, "
+                f"lbfgs_lr={self.lbfgs_lr}."
+            )
+        if self.scheduler not in ("plateau", "cosine", "none"):
+            raise ValueError(f"Scheduler inconnu : {self.scheduler!r}.")
+        if not (0.0 < self.scheduler_factor < 1.0):
+            raise ValueError(
+                f"scheduler_factor doit être dans (0, 1), reçu {self.scheduler_factor}."
+            )
+        if self.scheduler_patience < 0:
+            raise ValueError(f"scheduler_patience doit être ≥ 0.")
+        if self.scheduler_min_lr < 0.0:
+            raise ValueError("scheduler_min_lr doit être ≥ 0.")
+        if self.weighting not in ("fixed", "grad_norm", "lr_annealing"):
+            raise ValueError(f"Schéma de pondération inconnu : {self.weighting!r}.")
+        if self.weighting_update_every < 1:
+            raise ValueError("weighting_update_every doit être ≥ 1.")
+        if self.weighting_warmup < 0:
+            raise ValueError("weighting_warmup doit être ≥ 0.")
+        if self.weighting_eps <= 0.0:
+            raise ValueError("weighting_eps doit être > 0.")
+        if self.es_monitor not in ("total", "residual"):
+            raise ValueError(f"es_monitor inconnu : {self.es_monitor!r}.")
+        if self.es_patience < 1:
+            raise ValueError("es_patience doit être ≥ 1.")
+        if self.es_min_delta < 0.0:
+            raise ValueError("es_min_delta doit être ≥ 0.")
+        if self.log_every < 1 or self.lbfgs_log_every < 1 or self.checkpoint_every < 1:
+            raise ValueError("log_every, lbfgs_log_every et checkpoint_every doivent être ≥ 1.")
+        if self.lbfgs_max_iter < 1:
+            raise ValueError("lbfgs_max_iter doit être ≥ 1.")
+        if self.lbfgs_history_size < 1:
+            raise ValueError("lbfgs_history_size doit être ≥ 1.")
+        if self.lbfgs_line_search_fn not in (None, "strong_wolfe"):
+            raise ValueError(
+                f"lbfgs_line_search_fn invalide : {self.lbfgs_line_search_fn!r}. "
+                "Choisir None ou 'strong_wolfe'."
+            )
+        if self.adam_clip_grad_norm is not None and self.adam_clip_grad_norm <= 0.0:
+            raise ValueError("adam_clip_grad_norm doit être > 0 (ou None).")
+
+    @property
+    def lbfgs_max_closure_evals(self) -> int:
+        """
+        Borne supérieure du nombre d'évaluations de closure en phase L-BFGS.
+
+        Chaque appel à step() peut évaluer la closure jusqu'à
+        lbfgs_max_iter fois → budget pire-cas = iterations × max_iter.
+        Utile pour estimer le coût d'un run avant de le lancer.
+        """
+        return self.lbfgs_iterations * self.lbfgs_max_iter
+
+    def summary(self) -> str:
+        """Résumé textuel de la boucle d'entraînement (affiché par main_step3)."""
+        scheduler_description = {
+            "plateau": (
+                f"ReduceLROnPlateau (×{self.scheduler_factor} après "
+                f"{self.scheduler_patience} epochs, min {self.scheduler_min_lr:.1e})"
+            ),
+            "cosine": (
+                f"CosineAnnealingLR (T_max={self.adam_epochs}, "
+                f"min {self.scheduler_min_lr:.1e})"
+            ),
+            "none": "désactivé (lr constant)",
+        }[self.scheduler]
+        weighting_description = (
+            f"{self.weighting}"
+            if self.weighting == "fixed"
+            else (
+                f"{self.weighting} (toutes les {self.weighting_update_every} epochs, "
+                f"warmup {self.weighting_warmup}, × poids config)"
+            )
+        )
+        lines = [
+            "=" * 60,
+            "  TrainConfig — boucle hybride Adam → L-BFGS",
+            "=" * 60,
+            f"  Phase 1 Adam   : {self.adam_epochs} epochs, lr={self.adam_lr:.1e}"
+            + (f", clip={self.adam_clip_grad_norm}" if self.adam_clip_grad_norm else ""),
+            f"  Scheduler      : {scheduler_description}",
+            f"  Phase 2 L-BFGS : {self.lbfgs_iterations} itérations × "
+            f"(max_iter={self.lbfgs_max_iter}, history={self.lbfgs_history_size})",
+            f"                   lr={self.lbfgs_lr:.1f}, line search="
+            f"{self.lbfgs_line_search_fn or 'aucune'}",
+            f"  Pondération    : {weighting_description}",
+            f"  Early stopping : {'activé' if self.early_stopping else 'désactivé'} "
+            f"(métrique={self.es_monitor}, patience={self.es_patience}, "
+            f"min_delta={self.es_min_delta:.1e})",
+            f"  Logs           : 1/{self.log_every} epochs Adam, "
+            f"1/{self.lbfgs_log_every} itérations L-BFGS",
+            f"  Checkpoints    : toutes les {self.checkpoint_every} itérations "
+            "+ fin de phase + records",
+            "=" * 60,
+        ]
+        return "\n".join(lines)
+
+
 # Instances par défaut, importables partout :
 #   from config import DEFAULT_CONFIG, DEFAULT_MODEL_CONFIG, DEFAULT_LOSS_CONFIG
+#   from config import DEFAULT_TRAIN_CONFIG
 # Évite de recréer les dataclasses à chaque appel si on ne customisera rien.
 DEFAULT_CONFIG = DataConfig()
 DEFAULT_MODEL_CONFIG = ModelConfig()
 DEFAULT_LOSS_CONFIG = LossConfig()
+DEFAULT_TRAIN_CONFIG = TrainConfig()
