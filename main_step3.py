@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -129,10 +130,12 @@ def parse_args() -> argparse.Namespace:
         help="Epochs Adam avant la première mise à jour des poids (défaut : 0)",
     )
     parser.add_argument(
-        "--w-ic", type=float, default=1.0, help="Poids statique de L_ic (défaut : 1.0)",
+        "--w-ic", type=float, default=10.0,
+        help="Poids statique de L_ic (défaut : 10.0 — mesuré meilleur que 1.0, cf. README)",
     )
     parser.add_argument(
-        "--w-bc", type=float, default=1.0, help="Poids statique de L_bc (défaut : 1.0)",
+        "--w-bc", type=float, default=10.0,
+        help="Poids statique de L_bc (défaut : 10.0 — mesuré meilleur que 1.0, cf. README)",
     )
     parser.add_argument(
         "--w-res", type=float, default=1.0, help="Poids statique de L_res (défaut : 1.0)",
@@ -189,6 +192,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--n-res", type=int, default=None,
         help="Surcharge de N_res (défaut : DataConfig=20000 ; --test : 2000)",
+    )
+    parser.add_argument(
+        "--obj-shape", choices=["disk", "square"], default=None,
+        help="Forme de l'objet chaud (défaut : DataConfig = disk)",
+    )
+    parser.add_argument(
+        "--obj-cx", type=float, default=None, help="Centre x* de l'objet (défaut 0.5)",
+    )
+    parser.add_argument(
+        "--obj-cy", type=float, default=None, help="Centre y* de l'objet (défaut 0.5)",
+    )
+    parser.add_argument(
+        "--obj-radius", type=float, default=None,
+        help="Rayon (disque) ou demi-côté (carré) de l'objet (défaut 0.15)",
     )
 
     # --- Exécution ----------------------------------------------------------------
@@ -260,6 +277,14 @@ def build_configs_from_args(
         data_kwargs["N_bc"] = args.n_bc
     if args.n_res is not None:
         data_kwargs["N_res"] = args.n_res
+    for cli_name, field_name in (
+        ("obj_shape", "obj_shape"),
+        ("obj_cx", "obj_cx"),
+        ("obj_cy", "obj_cy"),
+        ("obj_radius", "obj_radius"),
+    ):
+        if getattr(args, cli_name) is not None:
+            data_kwargs[field_name] = getattr(args, cli_name)
     cfg = DataConfig(**data_kwargs)
 
     model_kwargs: Dict[str, Any] = {"seed": args.seed}
@@ -460,6 +485,9 @@ def main() -> int:
         checkpoint_dir=Path(args.checkpoint_dir),
         use_tqdm=not args.no_tqdm,
         tensorboard_dir=tensorboard_dir,
+        # Recopié dans chaque checkpoint : l'Étape 4/5 retrouve ainsi l'objet
+        # chaud et l'architecture sans qu'on ait à les redonner à la main.
+        metadata={"data_cfg": asdict(cfg), "model_cfg": asdict(model_cfg)},
     )
 
     # Photographie mémoire AVANT le fit (après imports/matplotlib & données :
@@ -499,7 +527,7 @@ def main() -> int:
     print(f"  Historique     : {trainer.history_json_path.resolve()}")
 
     print("\n✓ Étape 3 terminée avec succès.")
-    print("  → Prochaine étape : démonstrateur interactif Gradio (Étape 4).")
+    print("  → Prochaine étape : validation numérique (python main_step4.py).")
     return 0
 
 

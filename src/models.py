@@ -499,6 +499,42 @@ class PINN(nn.Module):
         )
         return model.to(cfg.device)
 
+    def architecture(self) -> dict:
+        """
+        Décrit l'architecture sous forme de dict sérialisable.
+
+        POURQUOI ? Un checkpoint ne contient que des poids (state_dict) :
+        pour le recharger il faut reconstruire un réseau de MÊME forme.
+        Stocker ce dict dans le checkpoint évite d'avoir à redonner à la
+        main (et sans se tromper) les bons hyperparamètres — indispensable
+        pour le démonstrateur Gradio, qui charge des modèles de provenance
+        variée. Les bornes de normalisation sont aussi dans le state_dict,
+        mais on les écrit ici pour reconstruire le module avant le chargement.
+        """
+        description = {
+            "n_hidden_layers": self.n_hidden_layers,
+            "n_neurons": self.n_neurons,
+            "activation": self.activation_name,
+            "sine_omega": self.sine_omega,
+            "normalize_inputs": self.normalizer is not None,
+            "init_gain": self.init_gain,
+        }
+        if self.normalizer is not None:
+            lower = self.normalizer.lower.flatten().tolist()
+            upper = (self.normalizer.lower + self.normalizer.span).flatten().tolist()
+            description["input_lower"] = lower
+            description["input_upper"] = upper
+        return description
+
+    @classmethod
+    def from_architecture(cls, description: dict) -> "PINN":
+        """Reconstruit un réseau (poids aléatoires) depuis `architecture()`."""
+        kwargs = dict(description)
+        for key in ("input_lower", "input_upper"):
+            if key in kwargs:
+                kwargs[key] = tuple(kwargs[key])
+        return cls(**kwargs)
+
     @property
     def n_parameters(self) -> int:
         """

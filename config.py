@@ -498,6 +498,12 @@ class LossConfig:
 
 # Stratégie de pondération des trois termes de la loss.
 #   "fixed"        : poids statiques de LossConfig (référence, reproductible).
+#   ⚠ MESURE (3000 epochs Adam + 100 L-BFGS, objet par défaut, erreur L2
+#     relative globale vs différences finies) : poids fixes 1/1/1 → 34 %,
+#     poids fixes 10/10/1 → 25 %, "grad_norm" → 99 % (effondrement sur la
+#     solution triviale T* ≡ 0 ; dans l'historique le poids de l'IC tombe de 1 à
+#     0.001 pendant que sa perte reste à 0.065 ; cause non élucidée).
+#     Utiliser "fixed" avec w_ic = w_bc = 10 tant que ce schéma n'est pas corrigé.
 #   "grad_norm"    : w_i ∝ 1/‖∇_θ L_i‖₂  — équilibre les NORMES DE GRADIENTS
 #                    des trois termes (inspiré de GradNorm, Chen et al. 2018,
 #                    appliqué aux PINNs). Le terme dominant (ici L_res,

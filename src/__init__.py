@@ -30,14 +30,29 @@ Organisation pédagogique des modules
                   (fixed / grad_norm / lr_annealing), suivi TensorBoard/tqdm,
                   checkpoints best/last + history.json.
 
+    fd_solver.py  Solveur de référence aux différences finies (Étape 4),
+                  schéma explicite FTCS avec condition CFL.
+
+    inference.py  Rechargement d'un PINN depuis un checkpoint (architecture
+                  et DataConfig embarquées) et évaluation sur grille.
+
+    validation.py Métriques PINN vs référence : MSE, erreur L2 relative,
+                  par instant et globales ; figure de validation.
+
+    demo.py       Logique du démonstrateur (Étape 5), testable sans
+                  navigateur : géométrie, rendu, ré-entraînement.
+
+    gradio_app.py Câblage de l'interface Gradio (importé à la demande :
+                  `import src` ne requiert pas Gradio).
+
 Chaîne de dépendances (aucun cycle) :
     utils → sampling
     models → physics → losses → trainer
-
-Extensions futures (Étape 4+) : démonstrateur Gradio (inférence via
-PINN.predict + load_checkpoint), Residual Adaptive Resampling…
+    fd_solver, inference → validation → demo → gradio_app
 """
 
+from src.fd_solver import FDSolution, solve_heat_fd
+from src.inference import load_trained_model, predict_grid
 from src.losses import (
     LossTerms,
     loss_boundary,
@@ -55,6 +70,7 @@ from src.physics import (
 )
 from src.sampling import sample_bc, sample_ic, sample_residual
 from src.trainer import HISTORY_KEYS, FitResult, PINNTrainer
+from src.validation import ValidationReport, relative_l2_error, validate_pinn
 from src.utils import (
     format_seconds,
     get_device,
@@ -100,6 +116,14 @@ __all__ = [
     "save_checkpoint",
     "load_checkpoint",
     "plot_loss_history",
+    # Étape 4 — validation numérique
+    "FDSolution",
+    "solve_heat_fd",
+    "load_trained_model",
+    "predict_grid",
+    "ValidationReport",
+    "validate_pinn",
+    "relative_l2_error",
 ]
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"

@@ -254,6 +254,7 @@ class PINNTrainer:
         use_tqdm: bool = True,
         tensorboard_dir: Optional[Union[str, Path]] = None,
         verbose: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Parameters
@@ -279,8 +280,13 @@ class PINNTrainer:
             `tensorboard` ; sinon dégradation gracieuse en message).
         verbose : bool
             Affichage des lignes de log pendant fit().
+        metadata : dict, optional
+            Informations libres (ex. {"data_cfg": asdict(cfg)}) recopiées
+            dans `extra` de chaque checkpoint. Le démonstrateur s'en sert
+            pour retrouver l'objet chaud sur lequel le réseau a été entraîné.
         """
         self.model = model
+        self.metadata: Dict[str, Any] = dict(metadata) if metadata else {}
         self.loss_cfg = loss_cfg if loss_cfg is not None else DEFAULT_LOSS_CONFIG
         self.train_cfg = train_cfg if train_cfg is not None else DEFAULT_TRAIN_CONFIG
         self.verbose = verbose
@@ -1058,6 +1064,12 @@ class PINNTrainer:
                 "weighting": self.train_cfg.weighting,
                 "monitor": self.train_cfg.es_monitor,
                 "closure_evals": self._closure_evals,
+                "architecture": (
+                    self.model.architecture()
+                    if hasattr(self.model, "architecture")
+                    else None
+                ),
+                **self.metadata,
             },
         )
 
